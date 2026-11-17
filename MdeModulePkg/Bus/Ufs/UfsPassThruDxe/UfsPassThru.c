@@ -1710,12 +1710,13 @@ UfsPassThruDriverBindingStart (
         (UnitDescriptor.Length > UnitDescriptorSize) ||
         (UnitDescriptor.Length < OFFSET_OF (UFS_UNIT_DESC, LunEn) + sizeof (UnitDescriptor.LunEn)) ||
         (UnitDescriptor.DescType != UfsUnitDesc) || (UnitDescriptor.UnitIdx != Index) ||
-        (UnitDescriptor.LunEn > 1))
+        (UnitDescriptor.LunEn > 2))
     {
       continue;
     }
 
-    if (UnitDescriptor.LunEn == 0x1) {
+    // 0x02 is an enabled HPB LU, not a disabled/reserved unit.
+    if ((UnitDescriptor.LunEn == 0x1) || (UnitDescriptor.LunEn == 0x2)) {
       DEBUG ((DEBUG_INFO, "UFS LUN %X is enabled\n", Index));
       Private->Luns.BitMask |= (BIT0 << Index);
     }

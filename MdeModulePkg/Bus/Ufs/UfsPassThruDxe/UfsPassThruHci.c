@@ -1081,6 +1081,81 @@ UfsGetReturnDataFromQueryResponse (
   return EFI_SUCCESS;
 }
 
+STATIC
+EFI_STATUS
+UfsValidateQueryResponse (
+  IN  UFS_PASS_THRU_TRANS_REQ             *TransReq,
+  IN  UFS_DEVICE_MANAGEMENT_REQUEST_PACKET *Packet,
+  OUT UTP_QUERY_RESP_UPIU                  **QueryResponse
+  )
+{
+  UTP_QUERY_REQ_UPIU   *Request;
+  UTP_QUERY_RESP_UPIU  *Response;
+  UINTN                ResponseOffset;
+  UINTN                ResponseBytes;
+  UINTN                ExpectedOffset;
+  UINTN                ExpectedBytes;
+  UINT16               DataBytes;
+  UINT16               ReturnedBytes;
+
+  *QueryResponse = NULL;
+  ResponseOffset = (UINTN)TransReq->Trd->RuO * sizeof (UINT32);
+  ResponseBytes  = (UINTN)TransReq->Trd->RuL * sizeof (UINT32);
+  ExpectedOffset = ROUNDUP8 (sizeof (UTP_QUERY_REQ_UPIU));
+  ExpectedBytes  = ROUNDUP8 (sizeof (UTP_QUERY_RESP_UPIU));
+  if (Packet->Opcode == UtpQueryFuncOpcodeWrDesc) {
+    ExpectedOffset += ROUNDUP8 (Packet->TransferLength);
+  } else if (Packet->Opcode == UtpQueryFuncOpcodeRdDesc) {
+    ExpectedBytes += ROUNDUP8 (Packet->TransferLength);
+  }
+  if ((TransReq->CmdDescSize < sizeof (UTP_QUERY_REQ_UPIU)) ||
+      (ResponseOffset != ExpectedOffset) || (ResponseBytes != ExpectedBytes) ||
+      (ResponseOffset > TransReq->CmdDescSize) ||
+      (ResponseBytes > TransReq->CmdDescSize - ResponseOffset))
+  {
+    return EFI_DEVICE_ERROR;
+  }
+
+  Request  = (UTP_QUERY_REQ_UPIU *)TransReq->CmdDescHost;
+  Response = (UTP_QUERY_RESP_UPIU *)((UINT8 *)TransReq->CmdDescHost + ResponseOffset);
+  if ((Response->TransCode != 0x36) || (Response->TaskTag != Request->TaskTag) ||
+      (Response->QueryFunc != Request->QueryFunc) || (Response->EhsLen != 0))
+  {
+    return EFI_DEVICE_ERROR;
+  }
+
+  // Error replies carry no usable return data. Validate successful identity
+  // and wire lengths before trusting descriptor, attribute or flag values.
+  if (Response->QueryResp == UfsUtpQueryResponseSuccess) {
+    if ((Response->Tsf.Opcode != Packet->Opcode) ||
+        (Response->Tsf.DescId != Packet->DescId) ||
+        (Response->Tsf.Index != Packet->Index) ||
+        (Response->Tsf.Selector != Packet->Selector))
+    {
+      return EFI_DEVICE_ERROR;
+    }
+
+    DataBytes = Response->DataSegLen;
+    ReturnedBytes = Response->Tsf.Length;
+    SwapLittleEndianToBigEndian ((UINT8 *)&DataBytes, sizeof (DataBytes));
+    SwapLittleEndianToBigEndian ((UINT8 *)&ReturnedBytes, sizeof (ReturnedBytes));
+    if (Packet->Opcode == UtpQueryFuncOpcodeRdDesc) {
+      if ((ReturnedBytes != DataBytes) || (ReturnedBytes > Packet->TransferLength) ||
+          (DataBytes > ResponseBytes - sizeof (*Response)))
+      {
+        return EFI_DEVICE_ERROR;
+      }
+    } else if ((DataBytes != 0) ||
+               ((Packet->Opcode == UtpQueryFuncOpcodeWrDesc) ?
+                (ReturnedBytes > Packet->TransferLength) : (ReturnedBytes != 0)))
+    {
+      return EFI_DEVICE_ERROR;
+    }
+  }
+  *QueryResponse = Response;
+  return EFI_SUCCESS;
+}
+
 /**
   Creates Transfer Request descriptor and sends Query Request to the device.
 
@@ -1153,7 +1228,6 @@ UfsSendDmRequestRetry (
     return Status;
   }
 
-  QueryResp = (UTP_QUERY_RESP_UPIU *)((UINT8 *)TransReq->CmdDescHost + TransReq->Trd->RuO * sizeof (UINT32));
   Status = UfsStartExecCmd (Private, Slot, NULL);
   if (EFI_ERROR (Status)) {
     goto AbortRequest;
@@ -1170,7 +1244,10 @@ UfsSendDmRequestRetry (
     return Status;
   }
 
-  if ((TransReq->Trd->Ocs != 0) || (QueryResp->QueryResp != UfsUtpQueryResponseSuccess)) {
+  Status = UfsValidateQueryResponse (TransReq, Packet, &QueryResp);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "Invalid UFS query response identity or length\n"));
+  } else if ((TransReq->Trd->Ocs != 0) || (QueryResp->QueryResp != UfsUtpQueryResponseSuccess)) {
     DEBUG ((DEBUG_ERROR, "Failed to send query request, OCS = %X, QueryResp = %X\n", TransReq->Trd->Ocs, QueryResp->QueryResp));
     DumpQueryResponseResult (QueryResp->QueryResp);
 
@@ -3062,7 +3139,7 @@ UfsPrepareDevicePowerDown (
         (Unit[Index].Length > UnitSize) ||
         (Unit[Index].Length < OFFSET_OF (UFS_UNIT_DESC, LunEn) + sizeof (Unit[Index].LunEn)) ||
         (Unit[Index].DescType != UfsUnitDesc) || (Unit[Index].UnitIdx != Index) ||
-        (Unit[Index].LunEn > 1))
+        (Unit[Index].LunEn > 2))
     {
       return EFI_DEVICE_ERROR;
     }
