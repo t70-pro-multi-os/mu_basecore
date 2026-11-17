@@ -32,7 +32,7 @@ extern USB_MASS_TRANSPORT  mUsbBotTransport;
 //
 // Usb Bot retry to get CSW, refers to specification[BOT10-5.3, it says 2 times]
 //
-#define USB_BOT_RECV_CSW_RETRY  3
+#define USB_BOT_RECV_CSW_RETRY  2
 
 //
 // Usb Bot wait device reset complete, set by experience

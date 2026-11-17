@@ -190,7 +190,7 @@ UsbBotSendCommand (
                             &Result
                             );
   if (EFI_ERROR (Status)) {
-    if (USB_IS_ERROR (Result, EFI_USB_ERR_STALL) && (DataDir == EfiUsbDataOut)) {
+    if (USB_IS_ERROR (Result, EFI_USB_ERR_STALL)) {
       //
       // Respond to Bulk-Out endpoint stall with a Reset Recovery,
       // according to section 5.3.1 of USB Mass Storage Class Bulk-Only Transport Spec, v1.0.
@@ -342,11 +342,13 @@ UsbBotGetStatus (
                       &Result
                       );
     if (EFI_ERROR (Status)) {
-      if (USB_IS_ERROR (Result, EFI_USB_ERR_STALL)) {
-        UsbClearEndpointStall (UsbIo, Endpoint);
+      // BOT Figure 2 permits one CSW retry after clearing Bulk-In. A second
+      // error, or a failed clear, requires reset recovery before another CBW.
+      if ((Index == 0) && !EFI_ERROR (UsbClearEndpointStall (UsbIo, Endpoint))) {
+        continue;
       }
-
-      continue;
+      UsbBotResetDevice (UsbBot, FALSE);
+      break;
     }
 
     if ((Len != sizeof (Csw)) || (Csw.Signature != USB_BOT_CSW_SIGNATURE) ||
