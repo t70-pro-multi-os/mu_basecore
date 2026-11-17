@@ -67,7 +67,26 @@ UFS_PASS_THRU_PRIVATE_DATA  gUfsPassThruTemplate = {
   {                               // Queue
     NULL,
     NULL
-  }
+  },
+  { NULL, NULL },                                                                                                                            // RegistryLink
+  FALSE,                                                                                                                                      // Registered
+  FALSE,                                                                                                                                      // Starting
+  FALSE,                                                                                                                                      // Stopping
+  FALSE,                                                                                                                                      // StopBusy
+  FALSE,                                                                                                                                      // HostProtocolOpened
+  FALSE,                                                                                                                                      // DeviceConfigInstalled
+  FALSE,                                                                                                                                      // ExtScsiInstalled
+  FALSE,                                                                                                                                      // ControllerInitAttempted
+  FALSE,                                                                                                                                      // ControllerStopComplete
+  FALSE,                                                                                                                                      // DeviceInitializationComplete
+  FALSE,                                                                                                                                      // DevicePowerDownComplete
+  FALSE,                                                                                                                                      // DevicePowerDownUncertain
+  FALSE,                                                                                                                                      // PlatformStopPrepared
+  FALSE,                                                                                                                                      // PlatformStopComplete
+  FALSE,                                                                                                                                      // StopUicAllowed
+  0,                                                                                                                                           // ActiveCalls
+  NULL,                                                                                                                                       // UfsHcPlatform
+  0                                                                                                                                           // ReservedTrlSlots
 };
 
 EFI_DRIVER_BINDING_PROTOCOL  gUfsPassThruDriverBinding = {
@@ -95,6 +114,437 @@ UFS_DEVICE_PATH  mUfsDevicePathTemplate = {
 UINT8  mUfsTargetId[TARGET_MAX_BYTES];
 
 GLOBAL_REMOVE_IF_UNREFERENCED EDKII_UFS_HC_PLATFORM_PROTOCOL  *mUfsHcPlatform;
+
+STATIC LIST_ENTRY  mUfsPassThruRegistry;
+STATIC BOOLEAN     mUfsPassThruRegistryInitialized;
+
+STATIC
+VOID
+UfsEnsureRegistryInitialized (
+  VOID
+  )
+{
+  EFI_TPL  OldTpl;
+
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  if (!mUfsPassThruRegistryInitialized) {
+    InitializeListHead (&mUfsPassThruRegistry);
+    mUfsPassThruRegistryInitialized = TRUE;
+  }
+
+  gBS->RestoreTPL (OldTpl);
+}
+
+STATIC
+EFI_STATUS
+UfsClaimPrivateByHandle (
+  IN  EFI_HANDLE                   Handle,
+  IN  BOOLEAN                      RequireStopping,
+  OUT UFS_PASS_THRU_PRIVATE_DATA   **Private,
+  OUT BOOLEAN                      *Found
+  )
+{
+  EFI_TPL                     OldTpl;
+  LIST_ENTRY                  *Entry;
+  UFS_PASS_THRU_PRIVATE_DATA  *Current;
+  EFI_STATUS                  Status;
+
+  if ((Private == NULL) || (Found == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  UfsEnsureRegistryInitialized ();
+  *Private = NULL;
+  *Found   = FALSE;
+  Status   = EFI_NOT_FOUND;
+  OldTpl   = gBS->RaiseTPL (TPL_NOTIFY);
+  for (Entry = GetFirstNode (&mUfsPassThruRegistry);
+       !IsNull (&mUfsPassThruRegistry, Entry);
+       Entry = GetNextNode (&mUfsPassThruRegistry, Entry))
+  {
+    Current = BASE_CR (Entry, UFS_PASS_THRU_PRIVATE_DATA, RegistryLink);
+    if (Current->Handle != Handle) {
+      continue;
+    }
+
+    *Found = TRUE;
+    if (Current->StopBusy || Current->Starting || (RequireStopping && !Current->Stopping)) {
+      Status = EFI_NOT_READY;
+      if (RequireStopping && !Current->Stopping) {
+        Status = EFI_ALREADY_STARTED;
+      }
+    } else {
+      Current->Stopping = TRUE;
+      Current->StopBusy = TRUE;
+      *Private = Current;
+      Status   = EFI_SUCCESS;
+    }
+
+    break;
+  }
+
+  gBS->RestoreTPL (OldTpl);
+  return Status;
+}
+
+STATIC
+EFI_STATUS
+UfsRegisterPrivate (
+  IN UFS_PASS_THRU_PRIVATE_DATA  *Private
+  )
+{
+  EFI_TPL                     OldTpl;
+  LIST_ENTRY                  *Entry;
+  UFS_PASS_THRU_PRIVATE_DATA  *Current;
+
+  UfsEnsureRegistryInitialized ();
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  for (Entry = GetFirstNode (&mUfsPassThruRegistry);
+       !IsNull (&mUfsPassThruRegistry, Entry);
+       Entry = GetNextNode (&mUfsPassThruRegistry, Entry))
+  {
+    Current = BASE_CR (Entry, UFS_PASS_THRU_PRIVATE_DATA, RegistryLink);
+    if (Current->Handle == Private->Handle) {
+      gBS->RestoreTPL (OldTpl);
+      return EFI_ALREADY_STARTED;
+    }
+  }
+
+  InsertTailList (&mUfsPassThruRegistry, &Private->RegistryLink);
+  Private->Registered = TRUE;
+  gBS->RestoreTPL (OldTpl);
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+UfsBeginCleanup (
+  IN UFS_PASS_THRU_PRIVATE_DATA  *Private,
+  IN BOOLEAN                     FromStart
+  )
+{
+  EFI_TPL     OldTpl;
+  EFI_STATUS  Status;
+
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  if (Private->StopBusy || (Private->Starting && !FromStart)) {
+    Status = EFI_NOT_READY;
+  } else {
+    Private->Stopping = TRUE;
+    Private->StopBusy = TRUE;
+    Status = EFI_SUCCESS;
+  }
+
+  gBS->RestoreTPL (OldTpl);
+  return Status;
+}
+
+STATIC
+VOID
+UfsEndCleanupAttempt (
+  IN UFS_PASS_THRU_PRIVATE_DATA  *Private,
+  IN BOOLEAN                     FromStart
+  )
+{
+  EFI_TPL  OldTpl;
+
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  Private->StopBusy = FALSE;
+  if (FromStart) {
+    Private->Starting = FALSE;
+  }
+
+  gBS->RestoreTPL (OldTpl);
+}
+
+STATIC
+VOID
+UfsUnregisterPrivate (
+  IN UFS_PASS_THRU_PRIVATE_DATA  *Private
+  )
+{
+  EFI_TPL  OldTpl;
+
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  if (Private->Registered) {
+    RemoveEntryList (&Private->RegistryLink);
+    InitializeListHead (&Private->RegistryLink);
+    Private->Registered = FALSE;
+  }
+
+  gBS->RestoreTPL (OldTpl);
+}
+
+STATIC
+EFI_STATUS
+UfsCleanupPrivate (
+  IN UFS_PASS_THRU_PRIVATE_DATA   *Private,
+  IN EFI_DRIVER_BINDING_PROTOCOL  *This,
+  IN BOOLEAN                      FromStart,
+  IN BOOLEAN                      Claimed
+  )
+{
+  EFI_STATUS                          Status;
+  EFI_TPL                             CurrentTpl;
+  EFI_TPL                             OldTpl;
+  EDKII_UFS_HOST_CONTROLLER_PROTOCOL  *UfsHc;
+
+  CurrentTpl = EfiGetCurrentTpl ();
+  if (CurrentTpl > TPL_CALLBACK) {
+    if (Claimed) {
+      UfsEndCleanupAttempt (Private, FromStart);
+    }
+
+    return EFI_NOT_READY;
+  }
+
+  if (!Claimed) {
+    Status = UfsBeginCleanup (Private, FromStart);
+    if (EFI_ERROR (Status)) {
+      if (FromStart) {
+        UfsEndCleanupAttempt (Private, TRUE);
+      }
+
+      return Status;
+    }
+  }
+
+  UfsHc = Private->UfsHostController;
+  if (Private->TimerEvent != NULL) {
+    Status = gBS->SetTimer (Private->TimerEvent, TimerCancel, 0);
+    if (EFI_ERROR (Status)) {
+      goto Error;
+    }
+
+    Status = gBS->CloseEvent (Private->TimerEvent);
+    if (EFI_ERROR (Status)) {
+      goto Error;
+    }
+
+    Private->TimerEvent = NULL;
+  }
+
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  Status = (Private->ActiveCalls == 0) ? EFI_SUCCESS : EFI_NOT_READY;
+  gBS->RestoreTPL (OldTpl);
+  if (EFI_ERROR (Status)) {
+    goto Error;
+  }
+
+  // Only a provider that explicitly advertises the stop contract gets device
+  // power commands. Version 3 providers keep their existing HCI-only teardown.
+  if ((Private->UfsHcPlatform != NULL) &&
+      (Private->UfsHcPlatform->Version >= EDKII_UFS_HC_PLATFORM_PROTOCOL_STOP_VERSION) &&
+      (Private->UfsHcPlatform->Callback != NULL) &&
+      Private->DeviceInitializationComplete && !Private->PlatformStopPrepared)
+  {
+    Status = UfsPrepareDevicePowerDown (Private);
+    if (EFI_ERROR (Status)) {
+      goto Error;
+    }
+
+    OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+    Private->StopUicAllowed = TRUE;
+    gBS->RestoreTPL (OldTpl);
+    Status = Private->UfsHcPlatform->Callback (
+                                      Private->Handle,
+                                      EdkiiUfsHcPrepareStop,
+                                      &Private->UfsHcDriverInterface
+                                      );
+    OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+    Private->StopUicAllowed = FALSE;
+    gBS->RestoreTPL (OldTpl);
+    if (EFI_ERROR (Status)) {
+      goto Error;
+    }
+
+    Private->PlatformStopPrepared = TRUE;
+  }
+
+  if (Private->ControllerInitAttempted && !Private->ControllerStopComplete) {
+    Status = UfsControllerStop (Private);
+    if (EFI_ERROR (Status)) {
+      goto Error;
+    }
+
+    Private->ControllerStopComplete = TRUE;
+  }
+
+  // This acknowledgement never drops clocks or DMA allocations. The board
+  // retains them until every consumer protocol and BY_DRIVER open is gone.
+  if (Private->PlatformStopPrepared && !Private->PlatformStopComplete) {
+    Status = Private->UfsHcPlatform->Callback (
+                                      Private->Handle,
+                                      EdkiiUfsHcHostStopped,
+                                      &Private->UfsHcDriverInterface
+                                      );
+    if (EFI_ERROR (Status)) {
+      goto Error;
+    }
+
+    Private->PlatformStopComplete = TRUE;
+  }
+
+  if (!IsListEmpty (&Private->Queue)) {
+    if (!Private->ControllerStopComplete) {
+      Status = EFI_NOT_READY;
+      goto Error;
+    }
+
+    Status = UfsAbortAsyncRequests (Private);
+    if (EFI_ERROR (Status)) {
+      goto Error;
+    }
+
+    if (!IsListEmpty (&Private->Queue)) {
+      Status = EFI_NOT_READY;
+      goto Error;
+    }
+  }
+
+  if (Private->TmrlMapping != NULL) {
+    Status = UfsHc->Unmap (UfsHc, Private->TmrlMapping);
+    if (EFI_ERROR (Status)) {
+      goto Error;
+    }
+
+    Private->TmrlMapping = NULL;
+  }
+
+  if (Private->UtpTmrlBase != NULL) {
+    Status = UfsHc->FreeBuffer (
+                      UfsHc,
+                      EFI_SIZE_TO_PAGES (Private->Nutmrs * sizeof (UTP_TMRD)),
+                      Private->UtpTmrlBase
+                      );
+    if (EFI_ERROR (Status)) {
+      goto Error;
+    }
+
+    Private->UtpTmrlBase = NULL;
+  }
+
+  if (Private->TrlMapping != NULL) {
+    Status = UfsHc->Unmap (UfsHc, Private->TrlMapping);
+    if (EFI_ERROR (Status)) {
+      goto Error;
+    }
+
+    Private->TrlMapping = NULL;
+  }
+
+  if (Private->UtpTrlBase != NULL) {
+    Status = UfsHc->FreeBuffer (
+                      UfsHc,
+                      EFI_SIZE_TO_PAGES (Private->Nutrs * sizeof (UTP_TRD)),
+                      Private->UtpTrlBase
+                      );
+    if (EFI_ERROR (Status)) {
+      goto Error;
+    }
+
+    Private->UtpTrlBase = NULL;
+  }
+
+  if (Private->ExtScsiInstalled) {
+    Status = gBS->UninstallProtocolInterface (
+                    Private->Handle,
+                    &gEfiExtScsiPassThruProtocolGuid,
+                    &Private->ExtScsiPassThru
+                    );
+    if (EFI_ERROR (Status)) {
+      goto Error;
+    }
+
+    Private->ExtScsiInstalled = FALSE;
+  }
+
+  if (Private->DeviceConfigInstalled) {
+    Status = gBS->UninstallProtocolInterface (
+                    Private->Handle,
+                    &gEfiUfsDeviceConfigProtocolGuid,
+                    &Private->UfsDevConfig
+                    );
+    if (EFI_ERROR (Status)) {
+      goto Error;
+    }
+
+    Private->DeviceConfigInstalled = FALSE;
+  }
+
+  if (Private->HostProtocolOpened) {
+    Status = gBS->CloseProtocol (
+                    Private->Handle,
+                    &gEdkiiUfsHostControllerProtocolGuid,
+                    This->DriverBindingHandle,
+                    Private->Handle
+                    );
+    if (EFI_ERROR (Status)) {
+      goto Error;
+    }
+
+    Private->HostProtocolOpened = FALSE;
+  }
+
+  UfsUnregisterPrivate (Private);
+  FreePool (Private);
+  return EFI_SUCCESS;
+
+Error:
+  UfsEndCleanupAttempt (Private, FromStart);
+  return Status;
+}
+
+EFI_STATUS
+UfsEnterCall (
+  IN  UFS_PASS_THRU_PRIVATE_DATA  *Private,
+  IN  BOOLEAN                    AllowStarting,
+  IN  BOOLEAN                    AllowNotify
+  )
+{
+  EFI_STATUS  Status;
+  EFI_TPL     CurrentTpl;
+  EFI_TPL     OldTpl;
+
+  if (Private == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  CurrentTpl = EfiGetCurrentTpl ();
+  if ((CurrentTpl > TPL_CALLBACK) && !(AllowNotify && (CurrentTpl == TPL_NOTIFY))) {
+    return EFI_NOT_READY;
+  }
+
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  if (Private->Stopping || (Private->Starting && !AllowStarting)) {
+    Status = EFI_NOT_READY;
+  } else if (Private->ActiveCalls == MAX_UINTN) {
+    Status = EFI_OUT_OF_RESOURCES;
+  } else {
+    Private->ActiveCalls++;
+    Status = EFI_SUCCESS;
+  }
+
+  gBS->RestoreTPL (OldTpl);
+  return Status;
+}
+
+VOID
+UfsLeaveCall (
+  IN  UFS_PASS_THRU_PRIVATE_DATA  *Private
+  )
+{
+  EFI_TPL  OldTpl;
+
+  ASSERT (Private != NULL);
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  ASSERT (Private->ActiveCalls != 0);
+  if (Private->ActiveCalls != 0) {
+    Private->ActiveCalls--;
+  }
+
+  gBS->RestoreTPL (OldTpl);
+}
 
 /**
   Sends a SCSI Request Packet to a SCSI device that is attached to the SCSI channel. This function
@@ -137,9 +587,9 @@ GLOBAL_REMOVE_IF_UNREFERENCED EDKII_UFS_HC_PLATFORM_PROTOCOL  *mUfsHcPlatform;
   @retval EFI_TIMEOUT           A timeout occurred while waiting for the SCSI Request Packet to execute.
 
 **/
+STATIC
 EFI_STATUS
-EFIAPI
-UfsPassThruPassThru (
+UfsPassThruPassThruInternal (
   IN EFI_EXT_SCSI_PASS_THRU_PROTOCOL                 *This,
   IN UINT8                                           *Target,
   IN UINT64                                          Lun,
@@ -249,9 +699,9 @@ UfsPassThruPassThru (
   @retval EFI_NOT_FOUND         There are no more SCSI devices on this SCSI channel.
 
 **/
+STATIC
 EFI_STATUS
-EFIAPI
-UfsPassThruGetNextTargetLun (
+UfsPassThruGetNextTargetLunInternal (
   IN  EFI_EXT_SCSI_PASS_THRU_PROTOCOL  *This,
   IN OUT UINT8                         **Target,
   IN OUT UINT64                        *Lun
@@ -379,9 +829,9 @@ UfsPassThruGetNextTargetLun (
   @retval EFI_OUT_OF_RESOURCES  There are not enough resources to allocate DevicePath.
 
 **/
+STATIC
 EFI_STATUS
-EFIAPI
-UfsPassThruBuildDevicePath (
+UfsPassThruBuildDevicePathInternal (
   IN     EFI_EXT_SCSI_PASS_THRU_PROTOCOL  *This,
   IN     UINT8                            *Target,
   IN     UINT64                           Lun,
@@ -457,9 +907,9 @@ UfsPassThruBuildDevicePath (
                                  DevicePath.
 
 **/
+STATIC
 EFI_STATUS
-EFIAPI
-UfsPassThruGetTargetLun (
+UfsPassThruGetTargetLunInternal (
   IN  EFI_EXT_SCSI_PASS_THRU_PROTOCOL  *This,
   IN  EFI_DEVICE_PATH_PROTOCOL         *DevicePath,
   OUT UINT8                            **Target,
@@ -540,9 +990,9 @@ UfsPassThruGetTargetLun (
   @retval EFI_UNSUPPORTED  The SCSI channel does not support a channel reset operation.
 
 **/
+STATIC
 EFI_STATUS
-EFIAPI
-UfsPassThruResetChannel (
+UfsPassThruResetChannelInternal (
   IN  EFI_EXT_SCSI_PASS_THRU_PROTOCOL  *This
   )
 {
@@ -571,9 +1021,9 @@ UfsPassThruResetChannel (
                                  specified by Target and Lun.
 
 **/
+STATIC
 EFI_STATUS
-EFIAPI
-UfsPassThruResetTargetLun (
+UfsPassThruResetTargetLunInternal (
   IN EFI_EXT_SCSI_PASS_THRU_PROTOCOL  *This,
   IN UINT8                            *Target,
   IN UINT64                           Lun
@@ -607,9 +1057,9 @@ UfsPassThruResetTargetLun (
   @retval EFI_NOT_FOUND         There are no more SCSI devices on this SCSI channel.
 
 **/
+STATIC
 EFI_STATUS
-EFIAPI
-UfsPassThruGetNextTarget (
+UfsPassThruGetNextTargetInternal (
   IN  EFI_EXT_SCSI_PASS_THRU_PROTOCOL  *This,
   IN OUT UINT8                         **Target
   )
@@ -625,6 +1075,189 @@ UfsPassThruGetNextTarget (
   }
 
   return EFI_NOT_FOUND;
+}
+
+EFI_STATUS
+EFIAPI
+UfsPassThruPassThru (
+  IN EFI_EXT_SCSI_PASS_THRU_PROTOCOL                 *This,
+  IN UINT8                                           *Target,
+  IN UINT64                                          Lun,
+  IN OUT EFI_EXT_SCSI_PASS_THRU_SCSI_REQUEST_PACKET  *Packet,
+  IN EFI_EVENT                                       Event OPTIONAL
+  )
+{
+  EFI_STATUS                  Status;
+  UFS_PASS_THRU_PRIVATE_DATA  *Private;
+
+  if (This == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Private = UFS_PASS_THRU_PRIVATE_DATA_FROM_THIS (This);
+  Status  = UfsEnterCall (Private, FALSE, FALSE);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = UfsPassThruPassThruInternal (This, Target, Lun, Packet, Event);
+  UfsLeaveCall (Private);
+  return Status;
+}
+
+EFI_STATUS
+EFIAPI
+UfsPassThruGetNextTargetLun (
+  IN  EFI_EXT_SCSI_PASS_THRU_PROTOCOL  *This,
+  IN OUT UINT8                         **Target,
+  IN OUT UINT64                        *Lun
+  )
+{
+  EFI_STATUS                  Status;
+  UFS_PASS_THRU_PRIVATE_DATA  *Private;
+
+  if (This == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Private = UFS_PASS_THRU_PRIVATE_DATA_FROM_THIS (This);
+  Status  = UfsEnterCall (Private, FALSE, FALSE);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = UfsPassThruGetNextTargetLunInternal (This, Target, Lun);
+  UfsLeaveCall (Private);
+  return Status;
+}
+
+EFI_STATUS
+EFIAPI
+UfsPassThruBuildDevicePath (
+  IN     EFI_EXT_SCSI_PASS_THRU_PROTOCOL  *This,
+  IN     UINT8                            *Target,
+  IN     UINT64                           Lun,
+  IN OUT EFI_DEVICE_PATH_PROTOCOL         **DevicePath
+  )
+{
+  EFI_STATUS                  Status;
+  UFS_PASS_THRU_PRIVATE_DATA  *Private;
+
+  if (This == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Private = UFS_PASS_THRU_PRIVATE_DATA_FROM_THIS (This);
+  Status  = UfsEnterCall (Private, FALSE, FALSE);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = UfsPassThruBuildDevicePathInternal (This, Target, Lun, DevicePath);
+  UfsLeaveCall (Private);
+  return Status;
+}
+
+EFI_STATUS
+EFIAPI
+UfsPassThruGetTargetLun (
+  IN  EFI_EXT_SCSI_PASS_THRU_PROTOCOL  *This,
+  IN  EFI_DEVICE_PATH_PROTOCOL         *DevicePath,
+  OUT UINT8                            **Target,
+  OUT UINT64                           *Lun
+  )
+{
+  EFI_STATUS                  Status;
+  UFS_PASS_THRU_PRIVATE_DATA  *Private;
+
+  if (This == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Private = UFS_PASS_THRU_PRIVATE_DATA_FROM_THIS (This);
+  Status  = UfsEnterCall (Private, FALSE, FALSE);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = UfsPassThruGetTargetLunInternal (This, DevicePath, Target, Lun);
+  UfsLeaveCall (Private);
+  return Status;
+}
+
+EFI_STATUS
+EFIAPI
+UfsPassThruResetChannel (
+  IN  EFI_EXT_SCSI_PASS_THRU_PROTOCOL  *This
+  )
+{
+  EFI_STATUS                  Status;
+  UFS_PASS_THRU_PRIVATE_DATA  *Private;
+
+  if (This == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Private = UFS_PASS_THRU_PRIVATE_DATA_FROM_THIS (This);
+  Status  = UfsEnterCall (Private, FALSE, FALSE);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = UfsPassThruResetChannelInternal (This);
+  UfsLeaveCall (Private);
+  return Status;
+}
+
+EFI_STATUS
+EFIAPI
+UfsPassThruResetTargetLun (
+  IN EFI_EXT_SCSI_PASS_THRU_PROTOCOL  *This,
+  IN UINT8                            *Target,
+  IN UINT64                           Lun
+  )
+{
+  EFI_STATUS                  Status;
+  UFS_PASS_THRU_PRIVATE_DATA  *Private;
+
+  if (This == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Private = UFS_PASS_THRU_PRIVATE_DATA_FROM_THIS (This);
+  Status  = UfsEnterCall (Private, FALSE, FALSE);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = UfsPassThruResetTargetLunInternal (This, Target, Lun);
+  UfsLeaveCall (Private);
+  return Status;
+}
+
+EFI_STATUS
+EFIAPI
+UfsPassThruGetNextTarget (
+  IN  EFI_EXT_SCSI_PASS_THRU_PROTOCOL  *This,
+  IN OUT UINT8                         **Target
+  )
+{
+  EFI_STATUS                  Status;
+  UFS_PASS_THRU_PRIVATE_DATA  *Private;
+
+  if (This == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Private = UFS_PASS_THRU_PRIVATE_DATA_FROM_THIS (This);
+  Status  = UfsEnterCall (Private, FALSE, FALSE);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = UfsPassThruGetNextTargetInternal (This, Target);
+  UfsLeaveCall (Private);
+  return Status;
 }
 
 /**
@@ -832,9 +1465,15 @@ UfsPassThruDriverBindingStart (
   )
 {
   EFI_STATUS                             Status;
+  EFI_STATUS                             CleanupStatus;
+  EFI_STATUS                             QueryStatus;
   EDKII_UFS_HOST_CONTROLLER_PROTOCOL     *UfsHc;
   UFS_PASS_THRU_PRIVATE_DATA             *Private;
+  UFS_PASS_THRU_PRIVATE_DATA             *ExistingPrivate;
+  BOOLEAN                                ExistingFound;
   UINTN                                  UfsHcBase;
+  EFI_TPL                                OldTpl;
+  VOID                                   *InstalledProtocol;
   UINT32                                 Index;
   UFS_UNIT_DESC                          UnitDescriptor;
   UFS_DEV_DESC                           DeviceDescriptor;
@@ -850,6 +1489,41 @@ UfsPassThruDriverBindingStart (
 
   DEBUG ((DEBUG_INFO, "==UfsPassThru Start== Controller = %x\n", Controller));
 
+  if (EfiGetCurrentTpl () > TPL_CALLBACK) {
+    return EFI_NOT_READY;
+  }
+
+  UfsEnsureRegistryInitialized ();
+  Status = UfsClaimPrivateByHandle (Controller, TRUE, &ExistingPrivate, &ExistingFound);
+  if (ExistingFound) {
+    if (EFI_ERROR (Status)) {
+      return Status;
+    }
+
+    Status = UfsCleanupPrivate (ExistingPrivate, This, FALSE, TRUE);
+    if (EFI_ERROR (Status)) {
+      return Status;
+    }
+  } else if (Status != EFI_NOT_FOUND) {
+    return Status;
+  }
+
+  Private = AllocateCopyPool (sizeof (UFS_PASS_THRU_PRIVATE_DATA), &gUfsPassThruTemplate);
+  if (Private == NULL) {
+    DEBUG ((DEBUG_ERROR, "Unable to allocate Ufs Pass Thru private data\n"));
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  Private->Handle   = Controller;
+  Private->Starting = TRUE;
+  InitializeListHead (&Private->Queue);
+  InitializeListHead (&Private->RegistryLink);
+  Status = UfsRegisterPrivate (Private);
+  if (EFI_ERROR (Status)) {
+    FreePool (Private);
+    return Status;
+  }
+
   Status = gBS->OpenProtocol (
                   Controller,
                   &gEdkiiUfsHostControllerProtocolGuid,
@@ -864,6 +1538,9 @@ UfsPassThruDriverBindingStart (
     goto Error;
   }
 
+  Private->HostProtocolOpened = TRUE;
+  Private->UfsHostController  = UfsHc;
+
   //
   // Get the UFS Host Controller MMIO Bar Base Address.
   //
@@ -873,32 +1550,40 @@ UfsPassThruDriverBindingStart (
     goto Error;
   }
 
-  //
   // Initialize Ufs Pass Thru private data for managed UFS Host Controller.
   //
-  Private = AllocateCopyPool (sizeof (UFS_PASS_THRU_PRIVATE_DATA), &gUfsPassThruTemplate);
-  if (Private == NULL) {
-    DEBUG ((DEBUG_ERROR, "Unable to allocate Ufs Pass Thru private data\n"));
-    Status = EFI_OUT_OF_RESOURCES;
-    goto Error;
-  }
-
   Private->ExtScsiPassThru.Mode                   = &Private->ExtScsiPassThruMode;
-  Private->UfsHostController                      = UfsHc;
   Private->UfsHcBase                              = UfsHcBase;
-  Private->Handle                                 = Controller;
   Private->UfsHcDriverInterface.UfsHcProtocol     = UfsHc;
   Private->UfsHcDriverInterface.UfsExecUicCommand = UfsHcDriverInterfaceExecUicCommand;
-  InitializeListHead (&Private->Queue);
 
   //
   // This has to be done before initializing UfsHcInfo or calling the UfsControllerInit
   //
-  if (mUfsHcPlatform == NULL) {
-    Status = gBS->LocateProtocol (&gEdkiiUfsHcPlatformProtocolGuid, NULL, (VOID **)&mUfsHcPlatform);
+  Status = gBS->HandleProtocol (
+                  Controller,
+                  &gEdkiiUfsHcPlatformProtocolGuid,
+                  (VOID **)&Private->UfsHcPlatform
+                  );
+  if (EFI_ERROR (Status)) {
+    Private->UfsHcPlatform = NULL;
+    Status = gBS->LocateProtocol (
+                    &gEdkiiUfsHcPlatformProtocolGuid,
+                    NULL,
+                    (VOID **)&Private->UfsHcPlatform
+                    );
     if (EFI_ERROR (Status)) {
-      DEBUG ((DEBUG_INFO, "No UfsHcPlatformProtocol present\n"));
+      Private->UfsHcPlatform = NULL;
     }
+
+    if (Private->UfsHcPlatform == NULL) {
+      mUfsHcPlatform = NULL;
+      DEBUG ((DEBUG_INFO, "No UfsHcPlatformProtocol present\n"));
+    } else {
+      mUfsHcPlatform = Private->UfsHcPlatform;
+    }
+  } else {
+    mUfsHcPlatform = Private->UfsHcPlatform;
   }
 
   Status = GetUfsHcInfo (Private);
@@ -910,6 +1595,7 @@ UfsPassThruDriverBindingStart (
   //
   // Initialize UFS Host Controller H/W.
   //
+  Private->ControllerInitAttempted = TRUE;
   Status = UfsControllerInit (Private);
   if (EFI_ERROR (Status)) {
     DEBUG ((DEBUG_ERROR, "Ufs Host Controller Initialization Error, Status = %r\n", Status));
@@ -933,17 +1619,19 @@ UfsPassThruDriverBindingStart (
     goto Error;
   }
 
-  if ((mUfsHcPlatform != NULL) &&
-      ((mUfsHcPlatform->RefClkFreq == EdkiiUfsCardRefClkFreq19p2Mhz) ||
-       (mUfsHcPlatform->RefClkFreq == EdkiiUfsCardRefClkFreq26Mhz) ||
-       (mUfsHcPlatform->RefClkFreq == EdkiiUfsCardRefClkFreq38p4Mhz)))
+  Private->DeviceInitializationComplete = TRUE;
+
+  if ((Private->UfsHcPlatform != NULL) &&
+      ((Private->UfsHcPlatform->RefClkFreq == EdkiiUfsCardRefClkFreq19p2Mhz) ||
+       (Private->UfsHcPlatform->RefClkFreq == EdkiiUfsCardRefClkFreq26Mhz) ||
+       (Private->UfsHcPlatform->RefClkFreq == EdkiiUfsCardRefClkFreq38p4Mhz)))
   {
     RefClkAttr = UfsAttrRefClkFreq;
     Attributes = EdkiiUfsCardRefClkFreqObsolete;
     Status     = UfsRwAttributes (Private, TRUE, RefClkAttr, 0, 0, (UINT32 *)&Attributes);
     if (!EFI_ERROR (Status)) {
-      if (Attributes != mUfsHcPlatform->RefClkFreq) {
-        Attributes = mUfsHcPlatform->RefClkFreq;
+      if (Attributes != Private->UfsHcPlatform->RefClkFreq) {
+        Attributes = Private->UfsHcPlatform->RefClkFreq;
         DEBUG (
           (DEBUG_INFO,
            "Setting bRefClkFreq attribute(%x) to %x\n  0 -> 19.2 Mhz\n  1 -> 26 Mhz\n  2 -> 38.4 Mhz\n  3 -> Obsolete\n",
@@ -955,7 +1643,7 @@ UfsPassThruDriverBindingStart (
           DEBUG (
             (DEBUG_ERROR,
              "Failed to Change Reference Clock Attribute to %d, Status = %r \n",
-             mUfsHcPlatform->RefClkFreq,
+             Private->UfsHcPlatform->RefClkFreq,
              Status)
             );
         }
@@ -969,19 +1657,19 @@ UfsPassThruDriverBindingStart (
     }
   }
 
-  if ((mUfsHcPlatform != NULL) && (mUfsHcPlatform->Callback != NULL)) {
-    Status = mUfsHcPlatform->Callback (Private->Handle, EdkiiUfsHcPostLinkStartup, &Private->UfsHcDriverInterface);
+  if ((Private->UfsHcPlatform != NULL) && (Private->UfsHcPlatform->Callback != NULL)) {
+    Status = Private->UfsHcPlatform->Callback (Private->Handle, EdkiiUfsHcPostLinkStartup, &Private->UfsHcDriverInterface);
     if (EFI_ERROR (Status)) {
       DEBUG (
         (DEBUG_ERROR,
          "Failure from platform driver during EdkiiUfsHcPostLinkStartup, Status = %r\n",
          Status)
         );
-      return Status;
+      goto Error;
     }
   }
 
-  // MU_CHANGE [BEGIN] - Install UFS Device Config Protocol before caching the device config
+  // Install the UFS Device Config protocol before reading the device configuration.
   Status = gBS->InstallMultipleProtocolInterfaces (
                   &Controller,
                   &gEfiUfsDeviceConfigProtocolGuid,
@@ -989,15 +1677,41 @@ UfsPassThruDriverBindingStart (
                   NULL
                   );
   // MU_CHANGE [END]
+  if (EFI_ERROR (Status)) {
+    InstalledProtocol = NULL;
+    QueryStatus = gBS->HandleProtocol (
+                        Controller,
+                        &gEfiUfsDeviceConfigProtocolGuid,
+                        &InstalledProtocol
+                        );
+    if (!EFI_ERROR (QueryStatus) && (InstalledProtocol == &Private->UfsDevConfig)) {
+      Private->DeviceConfigInstalled = TRUE;
+    }
+
+    goto Error;
+  }
+
+  Private->DeviceConfigInstalled = TRUE;
 
   //
   // Check if 8 common luns are active and set corresponding bit mask.
   //
-  UnitDescriptorSize = sizeof (UFS_UNIT_DESC);
   for (Index = 0; Index < 8; Index++) {
+    // A failed/short query changes its size; each LU needs a fresh buffer.
+    UnitDescriptorSize = sizeof (UnitDescriptor);
+    ZeroMem (&UnitDescriptor, sizeof (UnitDescriptor));
     Status = UfsRwDeviceDesc (Private, TRUE, UfsUnitDesc, (UINT8)Index, 0, &UnitDescriptor, &UnitDescriptorSize);
     if (EFI_ERROR (Status)) {
       DEBUG ((DEBUG_ERROR, "Failed to read unit descriptor, index = %X, status = %r\n", Index, Status));
+      continue;
+    }
+
+    if ((UnitDescriptorSize < OFFSET_OF (UFS_UNIT_DESC, LunEn) + sizeof (UnitDescriptor.LunEn)) ||
+        (UnitDescriptor.Length > UnitDescriptorSize) ||
+        (UnitDescriptor.Length < OFFSET_OF (UFS_UNIT_DESC, LunEn) + sizeof (UnitDescriptor.LunEn)) ||
+        (UnitDescriptor.DescType != UfsUnitDesc) || (UnitDescriptor.UnitIdx != Index) ||
+        (UnitDescriptor.LunEn > 1))
+    {
       continue;
     }
 
@@ -1046,7 +1760,12 @@ UfsPassThruDriverBindingStart (
     goto Error;
   }
 
-  // MU_CHANGE [BEGIN] - Install UFS Device Config Protocol before caching the device config
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  Private->Starting = FALSE;
+  Private->StopBusy = TRUE;
+  gBS->RestoreTPL (OldTpl);
+
+  // Install the Ext SCSI Pass Thru protocol after the controller is ready.
   Status = gBS->InstallMultipleProtocolInterfaces (
                   &Controller,
                   &gEfiExtScsiPassThruProtocolGuid,
@@ -1054,42 +1773,39 @@ UfsPassThruDriverBindingStart (
                   NULL
                   );
   // MU_CHANGE [END]
-  ASSERT_EFI_ERROR (Status);
+  if (EFI_ERROR (Status)) {
+    InstalledProtocol = NULL;
+    QueryStatus = gBS->HandleProtocol (
+                        Controller,
+                        &gEfiExtScsiPassThruProtocolGuid,
+                        &InstalledProtocol
+                        );
+    if (!EFI_ERROR (QueryStatus) && (InstalledProtocol == &Private->ExtScsiPassThru)) {
+      Private->ExtScsiInstalled = TRUE;
+    }
+
+    OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+    Private->Starting = TRUE;
+    Private->StopBusy = FALSE;
+    gBS->RestoreTPL (OldTpl);
+    goto Error;
+  }
+
+  Private->ExtScsiInstalled = TRUE;
+
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  Private->StopBusy = FALSE;
+  gBS->RestoreTPL (OldTpl);
 
   return EFI_SUCCESS;
 
 Error:
   if (Private != NULL) {
-    if (Private->TmrlMapping != NULL) {
-      UfsHc->Unmap (UfsHc, Private->TmrlMapping);
+    CleanupStatus = UfsCleanupPrivate (Private, This, TRUE, FALSE);
+    if (EFI_ERROR (CleanupStatus)) {
+      DEBUG ((DEBUG_ERROR, "Ufs Start cleanup retained controller state, Status = %r\n", CleanupStatus));
+      Status = CleanupStatus;
     }
-
-    if (Private->UtpTmrlBase != NULL) {
-      UfsHc->FreeBuffer (UfsHc, EFI_SIZE_TO_PAGES (Private->Nutmrs * sizeof (UTP_TMRD)), Private->UtpTmrlBase);
-    }
-
-    if (Private->TrlMapping != NULL) {
-      UfsHc->Unmap (UfsHc, Private->TrlMapping);
-    }
-
-    if (Private->UtpTrlBase != NULL) {
-      UfsHc->FreeBuffer (UfsHc, EFI_SIZE_TO_PAGES (Private->Nutrs * sizeof (UTP_TMRD)), Private->UtpTrlBase);
-    }
-
-    if (Private->TimerEvent != NULL) {
-      gBS->CloseEvent (Private->TimerEvent);
-    }
-
-    FreePool (Private);
-  }
-
-  if (UfsHc != NULL) {
-    gBS->CloseProtocol (
-           Controller,
-           &gEdkiiUfsHostControllerProtocolGuid,
-           This->DriverBindingHandle,
-           Controller
-           );
   }
 
   return Status;
@@ -1130,102 +1846,26 @@ UfsPassThruDriverBindingStop (
   IN  EFI_HANDLE                   *ChildHandleBuffer
   )
 {
-  EFI_STATUS                          Status;
-  UFS_PASS_THRU_PRIVATE_DATA          *Private;
-  EFI_EXT_SCSI_PASS_THRU_PROTOCOL     *ExtScsiPassThru;
-  EDKII_UFS_HOST_CONTROLLER_PROTOCOL  *UfsHc;
-  UFS_PASS_THRU_TRANS_REQ             *TransReq;
-  LIST_ENTRY                          *Entry;
-  LIST_ENTRY                          *NextEntry;
+  EFI_STATUS                  Status;
+  UFS_PASS_THRU_PRIVATE_DATA  *Private;
+  BOOLEAN                     Found;
 
   DEBUG ((DEBUG_INFO, "==UfsPassThru Stop== Controller Controller = %x\n", Controller));
 
-  Status = gBS->OpenProtocol (
-                  Controller,
-                  &gEfiExtScsiPassThruProtocolGuid,
-                  (VOID **)&ExtScsiPassThru,
-                  This->DriverBindingHandle,
-                  Controller,
-                  EFI_OPEN_PROTOCOL_GET_PROTOCOL
-                  );
+  if (EfiGetCurrentTpl () > TPL_CALLBACK) {
+    return EFI_NOT_READY;
+  }
+
+  Status = UfsClaimPrivateByHandle (Controller, FALSE, &Private, &Found);
+  if (Status == EFI_NOT_FOUND) {
+    return EFI_NOT_FOUND;
+  }
 
   if (EFI_ERROR (Status)) {
-    return EFI_DEVICE_ERROR;
+    return Status;
   }
 
-  Private = UFS_PASS_THRU_PRIVATE_DATA_FROM_THIS (ExtScsiPassThru);
-  UfsHc   = Private->UfsHostController;
-
-  //
-  // Cleanup the resources of I/O requests in the async I/O queue
-  //
-  if (!IsListEmpty (&Private->Queue)) {
-    BASE_LIST_FOR_EACH_SAFE (Entry, NextEntry, &Private->Queue) {
-      TransReq = UFS_PASS_THRU_TRANS_REQ_FROM_THIS (Entry);
-
-      //
-      // TODO: Should find/add a proper host adapter return status for this
-      // case.
-      //
-      TransReq->Packet->HostAdapterStatus =
-        EFI_EXT_SCSI_STATUS_HOST_ADAPTER_PHASE_ERROR;
-
-      SignalCallerEvent (Private, TransReq);
-    }
-  }
-
-  Status = gBS->UninstallMultipleProtocolInterfaces (
-                  Controller,
-                  &gEfiExtScsiPassThruProtocolGuid,
-                  &(Private->ExtScsiPassThru),
-                  &gEfiUfsDeviceConfigProtocolGuid,
-                  &(Private->UfsDevConfig),
-                  NULL
-                  );
-
-  if (EFI_ERROR (Status)) {
-    return EFI_DEVICE_ERROR;
-  }
-
-  //
-  // Stop Ufs Host Controller
-  //
-  Status = UfsControllerStop (Private);
-  ASSERT_EFI_ERROR (Status);
-
-  if (Private->TmrlMapping != NULL) {
-    UfsHc->Unmap (UfsHc, Private->TmrlMapping);
-  }
-
-  if (Private->UtpTmrlBase != NULL) {
-    UfsHc->FreeBuffer (UfsHc, EFI_SIZE_TO_PAGES (Private->Nutmrs * sizeof (UTP_TMRD)), Private->UtpTmrlBase);
-  }
-
-  if (Private->TrlMapping != NULL) {
-    UfsHc->Unmap (UfsHc, Private->TrlMapping);
-  }
-
-  if (Private->UtpTrlBase != NULL) {
-    UfsHc->FreeBuffer (UfsHc, EFI_SIZE_TO_PAGES (Private->Nutrs * sizeof (UTP_TMRD)), Private->UtpTrlBase);
-  }
-
-  if (Private->TimerEvent != NULL) {
-    gBS->CloseEvent (Private->TimerEvent);
-  }
-
-  FreePool (Private);
-
-  //
-  // Close protocols opened by UfsPassThru controller driver
-  //
-  gBS->CloseProtocol (
-         Controller,
-         &gEdkiiUfsHostControllerProtocolGuid,
-         This->DriverBindingHandle,
-         Controller
-         );
-
-  return Status;
+  return UfsCleanupPrivate (Private, This, FALSE, TRUE);
 }
 
 /**
@@ -1246,6 +1886,8 @@ InitializeUfsPassThru (
   )
 {
   EFI_STATUS  Status;
+
+  UfsEnsureRegistryInitialized ();
 
   //
   // Install driver model protocol(s).
