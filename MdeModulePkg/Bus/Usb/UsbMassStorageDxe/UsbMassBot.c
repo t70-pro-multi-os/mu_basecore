@@ -296,6 +296,7 @@ UsbBotDataTransfer (
   @param  UsbBot         The USB BOT device.
   @param  TransLen       The expected length of the data.
   @param  CmdStatus      The result of the command execution.
+  @param  DataResidue    Data bytes the device reports as unprocessed.
 
   @retval EFI_SUCCESS    Command execute result is retrieved and in the Result.
   @retval Other          Error occurred when trying to get status.
@@ -305,7 +306,8 @@ EFI_STATUS
 UsbBotGetStatus (
   IN  USB_BOT_PROTOCOL  *UsbBot,
   IN  UINT32            TransLen,
-  OUT UINT8             *CmdStatus
+  OUT UINT8             *CmdStatus,
+  OUT UINT32            *DataResidue
   )
 {
   USB_BOT_CSW          Csw;
@@ -318,6 +320,7 @@ UsbBotGetStatus (
   UINTN                Timeout;
 
   *CmdStatus = USB_BOT_COMMAND_ERROR;
+  *DataResidue = TransLen;
   Status     = EFI_DEVICE_ERROR;
   Endpoint   = UsbBot->BulkInEndpoint->EndpointAddress;
   UsbIo      = UsbBot->UsbIo;
@@ -357,6 +360,7 @@ UsbBotGetStatus (
       break;
     } else {
       *CmdStatus = Csw.CmdStatus;
+      *DataResidue = Csw.DataResidue;
       break;
     }
   }
@@ -406,6 +410,7 @@ UsbBotExecCommand (
   EFI_STATUS        DataStatus;
   UINTN             TransLen;
   UINT8             Result;
+  UINT32            DataResidue;
 
   *CmdStatus = USB_MASS_CMD_FAIL;
   UsbBot     = (USB_BOT_PROTOCOL *)Context;
@@ -431,7 +436,7 @@ UsbBotExecCommand (
   //
   // Get the status, if that succeeds, interpret the result
   //
-  Status = UsbBotGetStatus (UsbBot, DataLen, &Result);
+  Status = UsbBotGetStatus (UsbBot, DataLen, &Result, &DataResidue);
   if (EFI_ERROR (Status)) {
     DEBUG ((DEBUG_ERROR, "UsbBotExecCommand: UsbBotGetStatus (%r)\n", Status));
     return Status;
@@ -442,8 +447,8 @@ UsbBotExecCommand (
       return DataStatus;
     }
 
-    // Fixed-size block reads must not succeed after a short USB transfer.
-    if ((TransLen != DataLen) &&
+    // Fixed-size reads require all bytes to be received and processed.
+    if (((TransLen != DataLen) || (DataResidue != 0)) &&
         ((*(UINT8 *)Cmd == USB_BOOT_READ10_OPCODE) ||
          (*(UINT8 *)Cmd == EFI_SCSI_OP_READ16) ||
          (*(UINT8 *)Cmd == USB_BOOT_READ_CAPACITY_OPCODE) ||
