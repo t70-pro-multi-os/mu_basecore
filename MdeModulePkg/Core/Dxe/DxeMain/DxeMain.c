@@ -576,6 +576,8 @@ DxeMain (
       EFI_ERROR_CODE | EFI_ERROR_MAJOR,
       (EFI_SOFTWARE_DXE_CORE | EFI_SW_DXE_CORE_EC_NO_ARCH)
       );
+    // RELEASE builds must not call a missing BDS protocol after this failure.
+    CpuDeadLoop ();
   }
 
   ASSERT_EFI_ERROR (Status);

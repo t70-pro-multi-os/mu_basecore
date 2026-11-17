@@ -75,6 +75,26 @@ typedef struct _UFS_PASS_THRU_PRIVATE_DATA {
   //
   EFI_EVENT                             TimerEvent;
   LIST_ENTRY                            Queue;
+
+  LIST_ENTRY                            RegistryLink;
+  BOOLEAN                               Registered;
+  BOOLEAN                               Starting;
+  BOOLEAN                               Stopping;
+  BOOLEAN                               StopBusy;
+  BOOLEAN                               HostProtocolOpened;
+  BOOLEAN                               DeviceConfigInstalled;
+  BOOLEAN                               ExtScsiInstalled;
+  BOOLEAN                               ControllerInitAttempted;
+  BOOLEAN                               ControllerStopComplete;
+  BOOLEAN                               DeviceInitializationComplete;
+  BOOLEAN                               DevicePowerDownComplete;
+  BOOLEAN                               DevicePowerDownUncertain;
+  BOOLEAN                               PlatformStopPrepared;
+  BOOLEAN                               PlatformStopComplete;
+  BOOLEAN                               StopUicAllowed;
+  UINTN                                 ActiveCalls;
+  EDKII_UFS_HC_PLATFORM_PROTOCOL        *UfsHcPlatform;
+  UINT32                                ReservedTrlSlots;
 } UFS_PASS_THRU_PRIVATE_DATA;
 
 #define UFS_PASS_THRU_TRANS_REQ_SIG  SIGNATURE_32 ('U', 'F', 'S', 'T')
@@ -84,6 +104,9 @@ typedef struct {
   LIST_ENTRY                                    TransferList;
 
   UINT8                                         Slot;
+  BOOLEAN                                       InternalPowerDown;
+  BOOLEAN                                       DoorbellAttempted;
+  BOOLEAN                                       PowerDownResponseKnown;
   UTP_TRD                                       *Trd;
   UINT32                                        CmdDescSize;
   VOID                                          *CmdDescHost;
@@ -681,6 +704,50 @@ UfsControllerStop (
   );
 
 /**
+  Abort and release all queued requests after the controller is confirmed stopped.
+
+  The helper must not copy DMA data into caller buffers. On failure, request ownership
+  remains queued for a later retry.
+
+  @param[in] Private  The UFS Pass Thru private data.
+
+  @retval EFI_SUCCESS  All queued request resources were released.
+  @retval Others       A resource could not be released; ownership is retained.
+**/
+EFI_STATUS
+UfsAbortAsyncRequests (
+  IN  UFS_PASS_THRU_PRIVATE_DATA  *Private
+  );
+
+/**
+  Enter or reject a pass-through call while protecting the private data lifetime.
+
+  @param[in] Private       The UFS Pass Thru private data.
+  @param[in] AllowStarting  Whether an internal UIC callback may run during Start.
+  @param[in] AllowNotify   Whether the TPL_NOTIFY timer callback is entering.
+
+  @retval EFI_SUCCESS      The call is protected until UfsLeaveCall.
+  @retval EFI_NOT_READY    Stop is in progress, or Start is not yet published.
+  @retval Others           The call count could not be updated.
+**/
+EFI_STATUS
+UfsEnterCall (
+  IN  UFS_PASS_THRU_PRIVATE_DATA  *Private,
+  IN  BOOLEAN                    AllowStarting,
+  IN  BOOLEAN                    AllowNotify
+  );
+
+/**
+  Leave a call previously admitted by UfsEnterCall.
+
+  @param[in] Private  The UFS Pass Thru private data.
+**/
+VOID
+UfsLeaveCall (
+  IN  UFS_PASS_THRU_PRIVATE_DATA  *Private
+  );
+
+/**
   Allocate common buffer for host and UFS bus master access simultaneously.
 
   @param[in]  Private                The pointer to the UFS_PASS_THRU_PRIVATE_DATA data structure.
@@ -993,4 +1060,9 @@ GetUfsHcInfo (
 extern EFI_COMPONENT_NAME_PROTOCOL     gUfsPassThruComponentName;
 extern EFI_COMPONENT_NAME2_PROTOCOL    gUfsPassThruComponentName2;
 extern EFI_DRIVER_BINDING_PROTOCOL     gUfsPassThruDriverBinding;
+EFI_STATUS
+UfsPrepareDevicePowerDown (
+  IN UFS_PASS_THRU_PRIVATE_DATA  *Private
+  );
+
 extern EDKII_UFS_HC_PLATFORM_PROTOCOL  *mUfsHcPlatform;

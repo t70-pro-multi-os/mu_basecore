@@ -151,7 +151,7 @@ UsbHubCtrlClearPortFeature (
   parent.
 
   @param  HubDev                The hub device.
-  @param  Port                  The port of the hub.
+  @param  Port                  The one-based translator port of the hub.
   @param  DevAddr               Address of the failed transaction.
   @param  EpNum                 The endpoint number of the failed transaction.
   @param  EpType                The type of failed transaction.
@@ -170,13 +170,38 @@ UsbHubCtrlClearTTBuffer (
   )
 {
   EFI_STATUS  Status;
-  UINT16      Value;
+  UINT16         Value;
+  UINT8          Index;
+  USB_INTERFACE  *HubIf;
+
+  // A single TT uses index 1; a multi-TT interface uses the physical port.
+  for (Index = 0; Index < HubDev->NumOfInterface; Index++) {
+    HubIf = HubDev->Interfaces[Index];
+    if ((HubIf != NULL) && UsbIsHubInterface (HubIf)) {
+      if (HubIf->IfSetting->Desc.InterfaceProtocol != 2) {
+        Port = 1;
+      }
+
+      break;
+    }
+  }
 
   //
   // Check USB2.0 spec page 424 for wValue's encoding
   //
   Value = (UINT16)((EpNum & 0x0F) | (DevAddr << 4) |
-                   ((EpType & 0x03) << 11) | ((EpNum & 0x80) << 15));
+                   ((EpType & 0x03) << 11) | ((EpNum & 0x80) << 8));
+
+  // Control transfers occupy both directions in the translator.
+  if (EpType == USB_ENDPOINT_CONTROL) {
+    Status = UsbCtrlRequest (
+               HubDev, EfiUsbNoData, USB_REQ_TYPE_CLASS, USB_HUB_TARGET_PORT,
+               USB_HUB_REQ_CLEAR_TT, (UINT16)(Value ^ BIT15), Port, NULL, 0
+               );
+    if (EFI_ERROR (Status)) {
+      return Status;
+    }
+  }
 
   Status = UsbCtrlRequest (
              HubDev,
@@ -185,7 +210,7 @@ UsbHubCtrlClearTTBuffer (
              USB_HUB_TARGET_PORT,
              USB_HUB_REQ_CLEAR_TT,
              Value,
-             (UINT16)(Port + 1),
+             Port,
              NULL,
              0
              );

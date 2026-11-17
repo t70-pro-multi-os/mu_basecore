@@ -131,6 +131,17 @@ FdtCheckHeader (
   return fdt_check_header (Fdt);
 }
 
+/** Validate all FDT blocks against the readable buffer size. **/
+INT32
+EFIAPI
+FdtCheckFull (
+  IN CONST VOID  *Fdt,
+  IN UINTN       BufferSize
+  )
+{
+  return fdt_check_full (Fdt, BufferSize);
+}
+
 /**
   Create a empty Flattened Device Tree.
 
@@ -303,7 +314,27 @@ FdtGetReserveMapEntry (
   OUT UINT64                *Size
   )
 {
-  return fdt_get_mem_rsv (Fdt, Index, Addr, Size);
+  uint64_t  FdtAddr;
+  uint64_t  FdtSize;
+  INTN      Status;
+
+  Status = fdt_get_mem_rsv (
+             Fdt,
+             Index,
+             (Addr == NULL) ? NULL : &FdtAddr,
+             (Size == NULL) ? NULL : &FdtSize
+             );
+  if (Status == 0) {
+    if (Addr != NULL) {
+      *Addr = (EFI_PHYSICAL_ADDRESS)FdtAddr;
+    }
+
+    if (Size != NULL) {
+      *Size = (UINT64)FdtSize;
+    }
+  }
+
+  return Status;
 }
 
 /**

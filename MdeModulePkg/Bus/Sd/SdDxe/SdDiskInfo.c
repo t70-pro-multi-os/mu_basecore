@@ -33,19 +33,30 @@ SdDiskInfoInquiry (
   )
 {
   EFI_STATUS  Status;
+  EFI_TPL     OldTpl;
   SD_DEVICE   *Device;
 
-  Device = SD_DEVICE_DATA_FROM_DISKINFO (This);
+  if ((This == NULL) || (InquiryDataSize == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
 
-  if (*InquiryDataSize >= sizeof (Device->Cid)) {
-    Status = EFI_SUCCESS;
-    CopyMem (InquiryData, &Device->Cid, sizeof (Device->Cid));
-  } else {
+  if ((*InquiryDataSize >= sizeof (SD_CID)) && (InquiryData == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  Device = SD_DEVICE_DATA_FROM_DISKINFO (This);
+  if (Device->MediaInvalidated || !Device->BlockMedia.MediaPresent) {
+    Status = EFI_NO_MEDIA;
+  } else if (*InquiryDataSize < sizeof (Device->Cid)) {
     Status = EFI_BUFFER_TOO_SMALL;
+  } else {
+    CopyMem (InquiryData, &Device->Cid, sizeof (Device->Cid));
+    Status = EFI_SUCCESS;
   }
 
   *InquiryDataSize = sizeof (Device->Cid);
-
+  gBS->RestoreTPL (OldTpl);
   return Status;
 }
 

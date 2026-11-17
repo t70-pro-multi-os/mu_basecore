@@ -38,6 +38,7 @@
   BaseLib
   MemoryAllocationLib
   UefiBootServicesTableLib
+  UefiBootManagerLib
   BaseMemoryLib
   DebugLib
   HiiLib

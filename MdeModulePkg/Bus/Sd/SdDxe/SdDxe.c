@@ -10,6 +10,7 @@
 **/
 
 #include "SdDxe.h"
+#include <Library/PcdLib.h>
 
 //
 // SdDxe Driver Binding Protocol Instance
@@ -50,7 +51,7 @@ SD_DEVICE  mSdDeviceTemplate = {
   {                            // BlockMedia
     0,                         // MediaId
     FALSE,                     // RemovableMedia
-    TRUE,                      // MediaPresent
+    FALSE,                     // MediaPresent until the CSD geometry is validated
     FALSE,                     // LogicPartition
     FALSE,                     // ReadOnly
     FALSE,                     // WritingCache
@@ -58,6 +59,9 @@ SD_DEVICE  mSdDeviceTemplate = {
     0,                         // IoAlign
     0                          // LastBlock
   },
+  FALSE,                       // MediaInvalidated
+  FALSE,                       // ResetInProgress
+  0,                           // ActiveOperations
   {                            // EraseBlock
     EFI_ERASE_BLOCK_PROTOCOL_REVISION,
     1,
@@ -84,8 +88,72 @@ SD_DEVICE  mSdDeviceTemplate = {
   {                            // ModelName
     0,
   },
-  NULL                         // Private
+  NULL,                        // Private
+  {                            // ChildLink
+    NULL,
+    NULL
+  },
+  FALSE,                       // ChildTracked
+  FALSE                        // StopInProgress
 };
+
+/**
+  Return whether a PassThru status means this child no longer names usable media.
+**/
+BOOLEAN
+SdMediaUnavailableStatus (
+  IN EFI_STATUS  Status
+  )
+{
+  return (BOOLEAN)(
+                    (Status == EFI_NO_MEDIA) ||
+                    (Status == EFI_NOT_FOUND) ||
+                    (Status == EFI_MEDIA_CHANGED)
+                    );
+}
+
+/**
+  Permanently invalidate this SD_DEVICE until its child handle is removed.
+
+  Block I/O has no media-refresh operation. A path becoming available again is
+  not enough to reuse the old CSD-derived geometry.
+**/
+VOID
+SdInvalidateMediaAtNotify (
+  IN SD_DEVICE  *Device
+  )
+{
+  if ((Device == NULL) || Device->MediaInvalidated) {
+    return;
+  }
+
+  Device->MediaInvalidated              = TRUE;
+  Device->BlockMedia.MediaPresent       = FALSE;
+  Device->BlockMedia.MediaId++;
+  if (Device->BlockMedia.MediaId == 0) {
+    Device->BlockMedia.MediaId = 1;
+  }
+
+  Device->BlockMedia.LastBlock = 0;
+  Device->EraseBlock.EraseLengthGranularity = 0;
+  Device->SectorAddressing = FALSE;
+}
+
+VOID
+SdInvalidateMedia (
+  IN SD_DEVICE  *Device
+  )
+{
+  EFI_TPL  OldTpl;
+
+  if (Device == NULL) {
+    return;
+  }
+
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  SdInvalidateMediaAtNotify (Device);
+  gBS->RestoreTPL (OldTpl);
+}
 
 /**
   Decode and print SD CSD Register content.
@@ -187,11 +255,14 @@ DiscoverUserArea (
   SD_CSD2     *Csd2;
   SD_CID      *Cid;
   UINT64      Capacity;
+  UINT64      BlockCount;
+  UINT64      CSize;
   UINT32      DevStatus;
   UINT16      Rca;
-  UINT32      CSize;
   UINT32      CSizeMul;
   UINT32      ReadBlLen;
+  UINT32      EraseLengthGranularity;
+  BOOLEAN     SectorAddressing;
 
   //
   // Deselect the device to force it enter stby mode.
@@ -210,6 +281,51 @@ DiscoverUserArea (
   Status = SdGetCsd (Device, Rca, Csd);
   if (EFI_ERROR (Status)) {
     return Status;
+  }
+
+  //
+  // Validate the addressable capacity before querying more card data or
+  // publishing Block I/O.  The byte-addressed CSD v1 path is limited to 4 GiB.
+  //
+  if (Csd->CsdStructure == 0) {
+    if ((Csd->ReadBlLen < 9) || (Csd->ReadBlLen > 11)) {
+      return EFI_UNSUPPORTED;
+    }
+
+    SectorAddressing = FALSE;
+    CSize            = (((UINT64)Csd->CSizeHigh << 2) | Csd->CSizeLow) + 1;
+    CSizeMul         = 1U << (Csd->CSizeMul + 2);
+    ReadBlLen        = 1U << Csd->ReadBlLen;
+    Capacity         = MultU64x32 (CSize, CSizeMul);
+    Capacity         = MultU64x32 (Capacity, ReadBlLen);
+    if (Capacity > SIZE_4GB) {
+      return EFI_UNSUPPORTED;
+    }
+  } else if (Csd->CsdStructure == 1) {
+    SectorAddressing = TRUE;
+    Csd2             = (SD_CSD2 *)(VOID *)Csd;
+    CSize             = (((UINT64)Csd2->CSizeHigh << 16) | Csd2->CSizeLow) + 1;
+    Capacity          = MultU64x32 (CSize, SIZE_512KB);
+  } else {
+    return EFI_UNSUPPORTED;
+  }
+
+  if ((Capacity == 0) || ((Capacity % 0x200) != 0)) {
+    return EFI_UNSUPPORTED;
+  }
+
+  BlockCount = Capacity / 0x200;
+  if ((BlockCount == 0) || (BlockCount > ((UINT64)MAX_UINT32 + 1ULL))) {
+    return EFI_UNSUPPORTED;
+  }
+
+  EraseLengthGranularity = 1;
+  if (!Csd->EraseBlkEn) {
+    if ((Csd->WriteBlLen < 9) || (Csd->WriteBlLen > 11)) {
+      return EFI_UNSUPPORTED;
+    }
+
+    EraseLengthGranularity = (Csd->SectorSize + 1U) * (1U << (Csd->WriteBlLen - 9U));
   }
 
   DumpCsd (Csd);
@@ -233,36 +349,197 @@ DiscoverUserArea (
     return Status;
   }
 
-  if (Csd->CsdStructure == 0) {
-    Device->SectorAddressing = FALSE;
-    CSize                    = (Csd->CSizeHigh << 2 | Csd->CSizeLow) + 1;
-    CSizeMul                 = (1 << (Csd->CSizeMul + 2));
-    ReadBlLen                = (1 << (Csd->ReadBlLen));
-    Capacity                 = MultU64x32 (MultU64x32 ((UINT64)CSize, CSizeMul), ReadBlLen);
-  } else {
-    Device->SectorAddressing = TRUE;
-    Csd2                     = (SD_CSD2 *)(VOID *)Csd;
-    CSize                    = (Csd2->CSizeHigh << 16 | Csd2->CSizeLow) + 1;
-    Capacity                 = MultU64x32 ((UINT64)CSize, SIZE_512KB);
-  }
-
+  Device->SectorAddressing            = SectorAddressing;
   Device->BlockIo.Media               = &Device->BlockMedia;
   Device->BlockIo2.Media              = &Device->BlockMedia;
   Device->BlockMedia.IoAlign          = Device->Private->PassThru->IoAlign;
   Device->BlockMedia.BlockSize        = 0x200;
-  Device->BlockMedia.LastBlock        = 0x00;
+  Device->BlockMedia.LastBlock        = (UINT32)(BlockCount - 1);
   Device->BlockMedia.RemovableMedia   = TRUE;
   Device->BlockMedia.MediaPresent     = TRUE;
   Device->BlockMedia.LogicalPartition = FALSE;
-  Device->BlockMedia.LastBlock        = DivU64x32 (Capacity, Device->BlockMedia.BlockSize) - 1;
+  Device->BlockMedia.ReadOnly         = (BOOLEAN)(PcdGetBool (PcdSdDxeReadOnly) ||
+                                                Csd->PermWriteProtect || Csd->TmpWriteProtect);
+  Device->EraseBlock.EraseLengthGranularity = EraseLengthGranularity;
 
-  if (Csd->EraseBlkEn) {
-    Device->EraseBlock.EraseLengthGranularity = 1;
-  } else {
-    Device->EraseBlock.EraseLengthGranularity = (Csd->SectorSize + 1) * (1 << (Csd->WriteBlLen - 9));
+  return Status;
+}
+
+/**
+  Determine whether the parent pass-through protocol has any child opens.
+**/
+STATIC
+EFI_STATUS
+SdGetChildOpenInformation (
+  IN  EFI_HANDLE                             Controller,
+  OUT EFI_OPEN_PROTOCOL_INFORMATION_ENTRY   **Entries,
+  OUT UINTN                                  *EntryCount
+  )
+{
+  EFI_STATUS  Status;
+
+  *Entries    = NULL;
+  *EntryCount = 0;
+  Status = gBS->OpenProtocolInformation (
+                  Controller,
+                  &gEfiSdMmcPassThruProtocolGuid,
+                  Entries,
+                  EntryCount
+                  );
+  if (Status == EFI_NOT_FOUND) {
+    return EFI_SUCCESS;
+  }
+
+  if (EFI_ERROR (Status) && (*Entries != NULL)) {
+    FreePool (*Entries);
+    *Entries    = NULL;
+    *EntryCount = 0;
   }
 
   return Status;
+}
+
+STATIC
+BOOLEAN
+SdHasChildOpen (
+  IN EFI_OPEN_PROTOCOL_INFORMATION_ENTRY  *Entries,
+  IN UINTN                                EntryCount
+  )
+{
+  UINTN  Index;
+
+  if (Entries == NULL) {
+    return FALSE;
+  }
+
+  for (Index = 0; Index < EntryCount; Index++) {
+    if ((Entries[Index].Attributes & EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER) != 0) {
+      return TRUE;
+    }
+  }
+
+  return FALSE;
+}
+
+STATIC
+SD_DEVICE *
+SdFindTrackedChild (
+  IN SD_DRIVER_PRIVATE_DATA  *Private,
+  IN EFI_HANDLE              ChildHandle
+  )
+{
+  LIST_ENTRY  *Link;
+  SD_DEVICE   *Device;
+
+  for (Link = GetFirstNode (&Private->Children);
+       !IsNull (&Private->Children, Link);
+       Link = GetNextNode (&Private->Children, Link))
+  {
+    Device = CR (Link, SD_DEVICE, ChildLink, SD_DEVICE_SIGNATURE);
+    if (Device->Handle == ChildHandle) {
+      return Device;
+    }
+  }
+
+  return NULL;
+}
+
+STATIC
+BOOLEAN
+SdIsTrackedChild (
+  IN SD_DRIVER_PRIVATE_DATA  *Private,
+  IN EFI_HANDLE              ChildHandle
+  )
+{
+  return (BOOLEAN)(SdFindTrackedChild (Private, ChildHandle) != NULL);
+}
+
+STATIC
+VOID
+SdForgetChild (
+  IN SD_DRIVER_PRIVATE_DATA  *Private,
+  IN SD_DEVICE               *Device
+  )
+{
+  if (Device->ChildTracked) {
+    RemoveEntryList (&Device->ChildLink);
+    Device->ChildTracked = FALSE;
+    ASSERT (Private->ChildCount != 0);
+    if (Private->ChildCount != 0) {
+      Private->ChildCount--;
+    }
+  }
+}
+
+STATIC
+BOOLEAN
+SdClaimChildStop (
+  IN SD_DEVICE  *Device
+  )
+{
+  EFI_TPL  OldTpl;
+
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  if ((Device->ActiveOperations != 0) || Device->ResetInProgress ||
+      Device->StopInProgress || !IsListEmpty (&Device->Queue))
+  {
+    gBS->RestoreTPL (OldTpl);
+    return FALSE;
+  }
+
+  Device->StopInProgress = TRUE;
+  gBS->RestoreTPL (OldTpl);
+  return TRUE;
+}
+
+STATIC
+VOID
+SdReleaseChildStop (
+  IN SD_DEVICE  *Device
+  )
+{
+  EFI_TPL  OldTpl;
+
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  Device->StopInProgress = FALSE;
+  gBS->RestoreTPL (OldTpl);
+}
+
+STATIC
+EFI_STATUS
+SdUninstallChild (
+  IN SD_DRIVER_PRIVATE_DATA  *Private,
+  IN SD_DEVICE               *Device
+  )
+{
+  EFI_STATUS  Status;
+
+  Status = gBS->UninstallMultipleProtocolInterfaces (
+                  Device->Handle,
+                  &gEfiDevicePathProtocolGuid,
+                  Device->DevicePath,
+                  &gEfiBlockIoProtocolGuid,
+                  &Device->BlockIo,
+                  &gEfiBlockIo2ProtocolGuid,
+                  &Device->BlockIo2,
+                  &gEfiEraseBlockProtocolGuid,
+                  &Device->EraseBlock,
+                  &gEfiDiskInfoProtocolGuid,
+                  &Device->DiskInfo,
+                  NULL
+                  );
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  SdForgetChild (Private, Device);
+  FreePool (Device->DevicePath);
+  if (Device->ControllerNameTable != NULL) {
+    FreeUnicodeStringTable (Device->ControllerNameTable);
+  }
+
+  FreePool (Device);
+  return EFI_SUCCESS;
 }
 
 /**
@@ -270,6 +547,7 @@ DiscoverUserArea (
 
   @param[in]  Private             The SD driver private data structure.
   @param[in]  Slot                The slot number to check device present.
+  @param[out] ChildInstalled      TRUE when this slot's child is published or tracked.
 
   @retval EFI_SUCCESS             Successfully to discover the device and attach
                                   SdMmcIoProtocol to it.
@@ -283,7 +561,8 @@ EFI_STATUS
 EFIAPI
 DiscoverSdDevice (
   IN  SD_DRIVER_PRIVATE_DATA  *Private,
-  IN  UINT8                   Slot
+  IN  UINT8                   Slot,
+  OUT BOOLEAN                 *ChildInstalled
   )
 {
   EFI_STATUS                     Status;
@@ -295,6 +574,7 @@ DiscoverSdDevice (
   EFI_SD_MMC_PASS_THRU_PROTOCOL  *PassThru;
 
   Device              = NULL;
+  *ChildInstalled     = FALSE;
   DevicePath          = NULL;
   NewDevicePath       = NULL;
   RemainingDevicePath = NULL;
@@ -331,10 +611,25 @@ DiscoverSdDevice (
   RemainingDevicePath = NewDevicePath;
   Status              = gBS->LocateDevicePath (&gEfiDevicePathProtocolGuid, &RemainingDevicePath, &DeviceHandle);
   if (!EFI_ERROR (Status) && (DeviceHandle != NULL) && IsDevicePathEnd (RemainingDevicePath)) {
-    //
-    // The device has been started, directly return to fast boot.
-    //
+    if (SdIsTrackedChild (Private, DeviceHandle)) {
+      *ChildInstalled = TRUE;
+      // A previously published orphan may have lost its parent-child link.
+      // Re-establish it when rediscovery reaches the same child path.
+      Status = gBS->OpenProtocol (
+                        Private->Controller,
+                        &gEfiSdMmcPassThruProtocolGuid,
+                        (VOID **)&(Private->PassThru),
+                        Private->DriverBindingHandle,
+                        DeviceHandle,
+                        EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER
+                        );
+    }
+
+    // The child path already exists. Keep it and let an explicit Stop retry
+    // cleanup if its relationship could not be restored here.
     Status = EFI_ALREADY_STARTED;
+    FreePool (NewDevicePath);
+    NewDevicePath = NULL;
     goto Error;
   }
 
@@ -376,6 +671,17 @@ DiscoverSdDevice (
     FALSE
     );
 
+  if (Private->ChildCount == MAX_UINTN) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto Error;
+  }
+
+  // Track and pin the child before publishing protocols, whose notifications
+  // may run before InstallMultipleProtocolInterfaces returns.
+  InsertTailList (&Private->Children, &Device->ChildLink);
+  Device->ChildTracked = TRUE;
+  Private->ChildCount++;
+  Device->StopInProgress = TRUE;
   Status = gBS->InstallMultipleProtocolInterfaces (
                   &Device->Handle,
                   &gEfiDevicePathProtocolGuid,
@@ -391,15 +697,74 @@ DiscoverSdDevice (
                   NULL
                   );
 
-  if (!EFI_ERROR (Status)) {
-    gBS->OpenProtocol (
-           Private->Controller,
-           &gEfiSdMmcPassThruProtocolGuid,
-           (VOID **)&(Private->PassThru),
-           Private->DriverBindingHandle,
-           Device->Handle,
-           EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER
-           );
+  if (EFI_ERROR (Status)) {
+    Device->StopInProgress = FALSE;
+    SdForgetChild (Private, Device);
+  } else {
+    *ChildInstalled = TRUE;
+    Status = gBS->OpenProtocol (
+                      Private->Controller,
+                      &gEfiSdMmcPassThruProtocolGuid,
+                      (VOID **)&(Private->PassThru),
+                      Private->DriverBindingHandle,
+                      Device->Handle,
+                      EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER
+                      );
+    if (Status == EFI_ALREADY_STARTED) {
+      SdReleaseChildStop (Device);
+      return EFI_SUCCESS;
+    }
+
+    if (EFI_ERROR (Status)) {
+      EFI_STATUS  OpenStatus;
+      EFI_STATUS  UninstallStatus;
+
+      OpenStatus = Status;
+      UninstallStatus = gBS->UninstallMultipleProtocolInterfaces (
+                          Device->Handle,
+                          &gEfiDevicePathProtocolGuid,
+                          Device->DevicePath,
+                          &gEfiBlockIoProtocolGuid,
+                          &Device->BlockIo,
+                          &gEfiBlockIo2ProtocolGuid,
+                          &Device->BlockIo2,
+                          &gEfiEraseBlockProtocolGuid,
+                          &Device->EraseBlock,
+                          &gEfiDiskInfoProtocolGuid,
+                          &Device->DiskInfo,
+                          NULL
+                          );
+      if (EFI_ERROR (UninstallStatus)) {
+        // Protocol consumers may already hold the child; keep its backing
+        // storage and retry the parent/child relationship once.
+        Status = gBS->OpenProtocol (
+                          Private->Controller,
+                          &gEfiSdMmcPassThruProtocolGuid,
+                          (VOID **)&(Private->PassThru),
+                          Private->DriverBindingHandle,
+                          Device->Handle,
+                          EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER
+                          );
+        FreePool (DevicePath);
+        if (!EFI_ERROR (Status) || (Status == EFI_ALREADY_STARTED)) {
+          SdReleaseChildStop (Device);
+          return EFI_SUCCESS;
+        }
+
+        // The child remains published but is not linked yet. Tombstone it and
+        // retain it in the private list so Stop(0) can retry its removal.
+        SdInvalidateMedia (Device);
+        SdReleaseChildStop (Device);
+        return UninstallStatus;
+      }
+
+      SdReleaseChildStop (Device);
+      SdForgetChild (Private, Device);
+      *ChildInstalled = FALSE;
+      Status = OpenStatus;
+    } else {
+      SdReleaseChildStop (Device);
+    }
   }
 
 Error:
@@ -410,6 +775,10 @@ Error:
   }
 
   if (EFI_ERROR (Status) && (Device != NULL)) {
+    if (Device->ControllerNameTable != NULL) {
+      FreeUnicodeStringTable (Device->ControllerNameTable);
+    }
+
     FreePool (Device);
   }
 
@@ -578,13 +947,23 @@ SdDxeDriverBindingStart (
   )
 {
   EFI_STATUS                     Status;
+  EFI_STATUS                     CleanupStatus;
   EFI_SD_MMC_PASS_THRU_PROTOCOL  *PassThru;
   EFI_DEVICE_PATH_PROTOCOL       *ParentDevicePath;
   SD_DRIVER_PRIVATE_DATA         *Private;
   UINT8                          Slot;
+  BOOLEAN                        ParentAlreadyStarted;
+  BOOLEAN                        ParentOpenedByThisCall;
+  BOOLEAN                        PrivateInstalled;
+  BOOLEAN                        ChildInstalled;
 
-  Private  = NULL;
-  PassThru = NULL;
+  Private                 = NULL;
+  PassThru                = NULL;
+  ParentDevicePath        = NULL;
+  ParentAlreadyStarted    = FALSE;
+  ParentOpenedByThisCall  = FALSE;
+  PrivateInstalled        = FALSE;
+  ChildInstalled          = FALSE;
   Status   = gBS->OpenProtocol (
                     Controller,
                     &gEfiSdMmcPassThruProtocolGuid,
@@ -596,6 +975,8 @@ SdDxeDriverBindingStart (
   if ((EFI_ERROR (Status)) && (Status != EFI_ALREADY_STARTED)) {
     return Status;
   }
+  ParentAlreadyStarted   = (BOOLEAN)(Status == EFI_ALREADY_STARTED);
+  ParentOpenedByThisCall = (BOOLEAN)!ParentAlreadyStarted;
 
   //
   // Check EFI_ALREADY_STARTED to reuse the original SD_DRIVER_PRIVATE_DATA.
@@ -615,11 +996,15 @@ SdDxeDriverBindingStart (
                     Controller,
                     EFI_OPEN_PROTOCOL_GET_PROTOCOL
                     );
-    ASSERT_EFI_ERROR (Status);
+    if (EFI_ERROR (Status)) {
+      goto Error;
+    }
+
     Private->PassThru            = PassThru;
     Private->Controller          = Controller;
     Private->ParentDevicePath    = ParentDevicePath;
     Private->DriverBindingHandle = This->DriverBindingHandle;
+    InitializeListHead (&Private->Children);
 
     Status = gBS->InstallProtocolInterface (
                     &Controller,
@@ -630,6 +1015,8 @@ SdDxeDriverBindingStart (
     if (EFI_ERROR (Status)) {
       goto Error;
     }
+
+    PrivateInstalled = TRUE;
   } else {
     Status = gBS->OpenProtocol (
                     Controller,
@@ -642,6 +1029,9 @@ SdDxeDriverBindingStart (
     if (EFI_ERROR (Status)) {
       goto Error;
     }
+
+    PrivateInstalled = TRUE;
+    PassThru         = Private->PassThru;
   }
 
   if (RemainingDevicePath == NULL) {
@@ -656,7 +1046,8 @@ SdDxeDriverBindingStart (
         break;
       }
 
-      Status = DiscoverSdDevice (Private, Slot);
+      ChildInstalled = FALSE;
+      Status = DiscoverSdDevice (Private, Slot, &ChildInstalled);
       if (EFI_ERROR (Status) && (Status != EFI_ALREADY_STARTED)) {
         break;
       }
@@ -664,26 +1055,74 @@ SdDxeDriverBindingStart (
   } else if (!IsDevicePathEnd (RemainingDevicePath)) {
     Status = PassThru->GetSlotNumber (PassThru, RemainingDevicePath, &Slot);
     if (!EFI_ERROR (Status)) {
-      Status = DiscoverSdDevice (Private, Slot);
+      ChildInstalled = FALSE;
+      Status = DiscoverSdDevice (Private, Slot, &ChildInstalled);
     }
   }
 
 Error:
+  if (Status == EFI_ALREADY_STARTED) {
+    // Existing tracked children are handled as rediscovery success; keep the
+    // binding active so a later Start can retry an orphan relationship.
+    return EFI_SUCCESS;
+  }
+
   if (EFI_ERROR (Status) && (Status != EFI_ALREADY_STARTED)) {
-    gBS->CloseProtocol (
-           Controller,
-           &gEfiSdMmcPassThruProtocolGuid,
-           This->DriverBindingHandle,
-           Controller
-           );
+    if ((Private != NULL) && (Private->ChildCount != 0)) {
+      // A partial Start remains bound so its children, including tombstoned
+      // orphans, can be retried through a later Start or Stop call.
+      return EFI_SUCCESS;
+    }
+
+    if (ParentAlreadyStarted) {
+      // Do not tear down state established by an earlier Start invocation.
+      return Status;
+    }
+
+    if (ParentOpenedByThisCall) {
+      CleanupStatus = gBS->CloseProtocol (
+                             Controller,
+                             &gEfiSdMmcPassThruProtocolGuid,
+                             This->DriverBindingHandle,
+                             Controller
+                             );
+      if (EFI_ERROR (CleanupStatus) && (CleanupStatus != EFI_NOT_FOUND)) {
+        return CleanupStatus;
+      }
+
+      ParentOpenedByThisCall = FALSE;
+    }
+
+    if (PrivateInstalled) {
+      CleanupStatus = gBS->UninstallProtocolInterface (
+                             Controller,
+                             &gEfiCallerIdGuid,
+                             Private
+                             );
+      if (EFI_ERROR (CleanupStatus)) {
+        // Preserve the private object and restore the parent binding if it
+        // was closed. A later Stop can retry this failed cleanup.
+        if (!ParentOpenedByThisCall) {
+          CleanupStatus = gBS->OpenProtocol (
+                                 Controller,
+                                 &gEfiSdMmcPassThruProtocolGuid,
+                                 (VOID **)&PassThru,
+                                 This->DriverBindingHandle,
+                                 Controller,
+                                 EFI_OPEN_PROTOCOL_BY_DRIVER
+                                 );
+          if (!EFI_ERROR (CleanupStatus) || (CleanupStatus == EFI_ALREADY_STARTED)) {
+            ParentOpenedByThisCall = TRUE;
+          }
+        }
+
+        return Status;
+      }
+
+      PrivateInstalled = FALSE;
+    }
 
     if (Private != NULL) {
-      gBS->UninstallMultipleProtocolInterfaces (
-             Controller,
-             &gEfiCallerIdGuid,
-             Private,
-             NULL
-             );
       FreePool (Private);
     }
   }
@@ -726,52 +1165,137 @@ SdDxeDriverBindingStop (
   IN  EFI_HANDLE                   *ChildHandleBuffer
   )
 {
-  EFI_STATUS                     Status;
-  BOOLEAN                        AllChildrenStopped;
-  UINTN                          Index;
-  SD_DRIVER_PRIVATE_DATA         *Private;
-  SD_DEVICE                      *Device;
-  EFI_SD_MMC_PASS_THRU_PROTOCOL  *PassThru;
-  EFI_BLOCK_IO2_PROTOCOL         *BlockIo2;
-  EFI_BLOCK_IO_PROTOCOL          *BlockIo;
-  LIST_ENTRY                     *Link;
-  LIST_ENTRY                     *NextLink;
-  SD_REQUEST                     *Request;
-  EFI_TPL                        OldTpl;
+  EFI_STATUS                           Status;
+  EFI_STATUS                           ReopenStatus;
+  BOOLEAN                              AllChildrenStopped;
+  UINTN                                Index;
+  SD_DRIVER_PRIVATE_DATA               *Private;
+  SD_DEVICE                            *Device;
+  EFI_SD_MMC_PASS_THRU_PROTOCOL        *PassThru;
+  EFI_BLOCK_IO2_PROTOCOL               *BlockIo2;
+  EFI_BLOCK_IO_PROTOCOL                *BlockIo;
+  BOOLEAN                              RetryRequired;
+  EFI_OPEN_PROTOCOL_INFORMATION_ENTRY  *OpenEntries;
+  UINTN                                OpenEntryCount;
+  LIST_ENTRY                           *Link;
+
+  Status = gBS->OpenProtocol (
+                  Controller,
+                  &gEfiCallerIdGuid,
+                  (VOID **)&Private,
+                  This->DriverBindingHandle,
+                  Controller,
+                  EFI_OPEN_PROTOCOL_GET_PROTOCOL
+                  );
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
 
   if (NumberOfChildren == 0) {
-    Status = gBS->OpenProtocol (
-                    Controller,
-                    &gEfiCallerIdGuid,
-                    (VOID **)&Private,
-                    This->DriverBindingHandle,
-                    Controller,
-                    EFI_OPEN_PROTOCOL_GET_PROTOCOL
-                    );
+    Status = SdGetChildOpenInformation (Controller, &OpenEntries, &OpenEntryCount);
     if (EFI_ERROR (Status)) {
-      return EFI_DEVICE_ERROR;
+      return Status;
     }
 
-    gBS->UninstallProtocolInterface (
-           Controller,
-           &gEfiCallerIdGuid,
-           Private
-           );
-    gBS->CloseProtocol (
-           Controller,
-           &gEfiSdMmcPassThruProtocolGuid,
-           This->DriverBindingHandle,
-           Controller
-           );
+    if (SdHasChildOpen (OpenEntries, OpenEntryCount)) {
+      if (OpenEntries != NULL) {
+        FreePool (OpenEntries);
+      }
+
+      return EFI_NOT_READY;
+    }
+
+    if (OpenEntries != NULL) {
+      FreePool (OpenEntries);
+    }
+
+    // Relationship-less published children are rollback orphans. Retry their
+    // removal here so ChildCount cannot permanently block parent Stop.
+    while (!IsListEmpty (&Private->Children)) {
+      Link   = GetFirstNode (&Private->Children);
+      Device = CR (Link, SD_DEVICE, ChildLink, SD_DEVICE_SIGNATURE);
+      SdInvalidateMedia (Device);
+      if (!SdClaimChildStop (Device)) {
+        return EFI_NOT_READY;
+      }
+
+      Status = gBS->CloseProtocol (
+                      Controller,
+                      &gEfiSdMmcPassThruProtocolGuid,
+                      This->DriverBindingHandle,
+                      Device->Handle
+                      );
+      if (EFI_ERROR (Status) && (Status != EFI_NOT_FOUND)) {
+        SdReleaseChildStop (Device);
+        return Status;
+      }
+
+      Status = SdUninstallChild (Private, Device);
+      if (EFI_ERROR (Status)) {
+        // Keep the relationship absent so another Stop(0) can retry this
+        // orphan after the protocol consumer releases it.
+        SdReleaseChildStop (Device);
+        return Status;
+      }
+    }
+
+    if (Private->ChildCount != 0) {
+      return EFI_NOT_READY;
+    }
+
+    // Close the parent first. If it fails, the caller-id interface still
+    // exposes Private for a later Stop retry.
+    Status = gBS->CloseProtocol (
+                    Controller,
+                    &gEfiSdMmcPassThruProtocolGuid,
+                    This->DriverBindingHandle,
+                    Controller
+                    );
+    if (EFI_ERROR (Status) && (Status != EFI_NOT_FOUND)) {
+      return Status;
+    }
+
+    Status = gBS->UninstallProtocolInterface (
+                    Controller,
+                    &gEfiCallerIdGuid,
+                    Private
+                    );
+    if (EFI_ERROR (Status)) {
+      ReopenStatus = gBS->OpenProtocol (
+                            Controller,
+                            &gEfiSdMmcPassThruProtocolGuid,
+                            (VOID **)&PassThru,
+                            This->DriverBindingHandle,
+                            Controller,
+                            EFI_OPEN_PROTOCOL_BY_DRIVER
+                            );
+      if (EFI_ERROR (ReopenStatus) && (ReopenStatus != EFI_ALREADY_STARTED)) {
+        // Keep Private installed even if the parent could not be rebound.
+        return Status;
+      }
+
+      return Status;
+    }
 
     FreePool (Private);
-
     return EFI_SUCCESS;
   }
 
+  if (ChildHandleBuffer == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
   AllChildrenStopped = TRUE;
+  RetryRequired      = FALSE;
 
   for (Index = 0; Index < NumberOfChildren; Index++) {
+    Device = SdFindTrackedChild (Private, ChildHandleBuffer[Index]);
+    if ((Device == NULL) || (Device->Private != Private) || !Device->ChildTracked) {
+      // Do not derive SD_DEVICE from a foreign BlockIo interface.
+      AllChildrenStopped = FALSE;
+      continue;
+    }
+
     BlockIo  = NULL;
     BlockIo2 = NULL;
     Status   = gBS->OpenProtocol (
@@ -791,87 +1315,59 @@ SdDxeDriverBindingStop (
                       Controller,
                       EFI_OPEN_PROTOCOL_GET_PROTOCOL
                       );
-      if (EFI_ERROR (Status)) {
+      if (EFI_ERROR (Status) || (BlockIo2 != &Device->BlockIo2)) {
         AllChildrenStopped = FALSE;
         continue;
       }
+    } else if (BlockIo != &Device->BlockIo) {
+      AllChildrenStopped = FALSE;
+      continue;
     }
 
-    if (BlockIo != NULL) {
-      Device = SD_DEVICE_DATA_FROM_BLKIO (BlockIo);
-    } else {
-      ASSERT (BlockIo2 != NULL);
-      Device = SD_DEVICE_DATA_FROM_BLKIO2 (BlockIo2);
+    // A failed or pending transfer still owns its command packet and may be
+    // using caller memory. Invalidate first, then let completions drain.
+    SdInvalidateMedia (Device);
+    if (!SdClaimChildStop (Device)) {
+      AllChildrenStopped = FALSE;
+      RetryRequired      = TRUE;
+      continue;
     }
 
-    //
-    // Free all on-going async tasks.
-    //
-    OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
-    for (Link = GetFirstNode (&Device->Queue);
-         !IsNull (&Device->Queue, Link);
-         Link = NextLink)
-    {
-      NextLink = GetNextNode (&Device->Queue, Link);
-      RemoveEntryList (Link);
-
-      Request = SD_REQUEST_FROM_LINK (Link);
-
-      gBS->CloseEvent (Request->Event);
-      Request->Token->TransactionStatus = EFI_ABORTED;
-
-      if (Request->IsEnd) {
-        gBS->SignalEvent (Request->Token->Event);
-      }
-
-      FreePool (Request);
-    }
-
-    gBS->RestoreTPL (OldTpl);
-
-    //
-    // Close the child handle
-    //
     Status = gBS->CloseProtocol (
                     Controller,
                     &gEfiSdMmcPassThruProtocolGuid,
                     This->DriverBindingHandle,
                     ChildHandleBuffer[Index]
                     );
+    if (EFI_ERROR (Status) && (Status != EFI_NOT_FOUND)) {
+      SdReleaseChildStop (Device);
+      AllChildrenStopped = FALSE;
+      continue;
+    }
 
-    Status = gBS->UninstallMultipleProtocolInterfaces (
-                    ChildHandleBuffer[Index],
-                    &gEfiDevicePathProtocolGuid,
-                    Device->DevicePath,
-                    &gEfiBlockIoProtocolGuid,
-                    &Device->BlockIo,
-                    &gEfiBlockIo2ProtocolGuid,
-                    &Device->BlockIo2,
-                    &gEfiEraseBlockProtocolGuid,
-                    &Device->EraseBlock,
-                    &gEfiDiskInfoProtocolGuid,
-                    &Device->DiskInfo,
-                    NULL
-                    );
+    Status = SdUninstallChild (Private, Device);
     if (EFI_ERROR (Status)) {
       AllChildrenStopped = FALSE;
-      gBS->OpenProtocol (
-             Controller,
-             &gEfiSdMmcPassThruProtocolGuid,
-             (VOID **)&PassThru,
-             This->DriverBindingHandle,
-             ChildHandleBuffer[Index],
-             EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER
-             );
-    } else {
-      FreePool (Device->DevicePath);
-      FreeUnicodeStringTable (Device->ControllerNameTable);
-      FreePool (Device);
+      RetryRequired      = TRUE;
+      ReopenStatus       = gBS->OpenProtocol (
+                                 Controller,
+                                 &gEfiSdMmcPassThruProtocolGuid,
+                                 (VOID **)&PassThru,
+                                 This->DriverBindingHandle,
+                                 ChildHandleBuffer[Index],
+                                 EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER
+                                 );
+      if (EFI_ERROR (ReopenStatus) && (ReopenStatus != EFI_ALREADY_STARTED)) {
+        // The tracked child remains available to an explicit Stop retry. Its
+        // missing relationship is tolerated by CloseProtocol on that retry.
+      }
+
+      SdReleaseChildStop (Device);
     }
   }
 
   if (!AllChildrenStopped) {
-    return EFI_DEVICE_ERROR;
+    return RetryRequired ? EFI_NOT_READY : EFI_DEVICE_ERROR;
   }
 
   return EFI_SUCCESS;

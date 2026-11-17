@@ -12,6 +12,13 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
 
 #define EDKII_UFS_HC_PLATFORM_PROTOCOL_VERSION  3
 
+// Local opt-in stop extension. Version 3 layout and callbacks remain unchanged.
+// Version 4 providers retain powered MMIO through the consumer's complete
+// teardown. PrepareStop is called only after successful device-WLUN POWERDOWN;
+// HostStopped follows HCE/run-stop/doorbell/base/IE zero proof. Neither callback
+// releases host clocks; the provider does that only after its consumer closes.
+#define EDKII_UFS_HC_PLATFORM_PROTOCOL_STOP_VERSION  4
+
 extern EFI_GUID  gEdkiiUfsHcPlatformProtocolGuid;
 
 typedef struct _EDKII_UFS_HC_PLATFORM_PROTOCOL EDKII_UFS_HC_PLATFORM_PROTOCOL;
@@ -79,7 +86,9 @@ typedef enum {
   EdkiiUfsHcPreHce,
   EdkiiUfsHcPostHce,
   EdkiiUfsHcPreLinkStartup,
-  EdkiiUfsHcPostLinkStartup
+  EdkiiUfsHcPostLinkStartup,
+  EdkiiUfsHcPrepareStop,
+  EdkiiUfsHcHostStopped
 } EDKII_UFS_HC_PLATFORM_CALLBACK_PHASE;
 
 typedef enum {
@@ -97,6 +106,11 @@ typedef enum {
   @param[in, out] CallbackData      Data specific to the callback phase.
                                     For PreHce and PostHce - EDKII_UFS_HC_DRIVER_INTERFACE.
                                     For PreLinkStartup and PostLinkStartup - EDKII_UFS_HC_DRIVER_INTERFACE.
+                                    Version 4 only: PrepareStop and HostStopped -
+                                    EDKII_UFS_HC_DRIVER_INTERFACE. PrepareStop
+                                    must leave MMIO, DMA and host clocks usable.
+                                    HostStopped must not release host clocks or
+                                    consumer DMA/protocol ownership.
 
   @retval EFI_SUCCESS            Override function completed successfully.
   @retval EFI_INVALID_PARAMETER  CallbackPhase is invalid or CallbackData is NULL when phase expects valid data.

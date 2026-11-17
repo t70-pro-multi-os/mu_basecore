@@ -34,6 +34,7 @@ UsbBootRequestSense (
   EFI_STATUS                   Status;
   UINT32                       CmdResult;
 
+  CmdResult = MAX_UINT32;
   Transport = UsbMass->Transport;
 
   //
@@ -57,6 +58,8 @@ UsbBootRequestSense (
                         USB_BOOT_GENERAL_CMD_TIMEOUT,
                         &CmdResult
                         );
+  T70UsbStorageDiagnostic (UsbMass->Controller, 4, Status, 3, (UINT8)UsbMass->Lun,
+    CmdResult, USB_BOOT_SENSE_KEY (SenseData.SenseKey), SenseData.Asc, SenseData.Ascq);
   if (EFI_ERROR (Status) || (CmdResult != USB_MASS_CMD_SUCCESS)) {
     DEBUG ((DEBUG_ERROR, "UsbBootRequestSense: (%r) CmdResult=0x%x\n", Status, CmdResult));
     if (!EFI_ERROR (Status)) {
@@ -180,7 +183,9 @@ UsbBootExecCmd (
   USB_MASS_TRANSPORT  *Transport;
   EFI_STATUS          Status;
   UINT32              CmdResult;
+  EFI_STATUS          SenseStatus;
 
+  CmdResult = MAX_UINT32;
   Transport = UsbMass->Transport;
   Status    = Transport->ExecCommand (
                            UsbMass->Context,
@@ -194,6 +199,8 @@ UsbBootExecCmd (
                            &CmdResult
                            );
 
+  T70UsbStorageDiagnostic (UsbMass->Controller, 3, Status, *(UINT8 *)Cmd,
+    (UINT8)UsbMass->Lun, CmdResult, 0, 0, 0);
   if (Status == EFI_TIMEOUT) {
     DEBUG ((DEBUG_ERROR, "UsbBootExecCmd: %r to Exec 0x%x Cmd\n", Status, *(UINT8 *)Cmd));
     return EFI_TIMEOUT;
@@ -211,7 +218,13 @@ UsbBootExecCmd (
   // If command execution failed, then retrieve error info via sense request.
   //
   DEBUG ((DEBUG_INFO, "UsbBootExecCmd: %r to Exec 0x%x Cmd (Result = %x)\n", Status, *(UINT8 *)Cmd, CmdResult));
-  return UsbBootRequestSense (UsbMass);
+  SenseStatus = UsbBootRequestSense (UsbMass);
+  if (EFI_ERROR (SenseStatus)) {
+    return SenseStatus;
+  }
+
+  // NO_SENSE does not make a failed command or transport successful.
+  return EFI_ERROR (Status) ? Status : EFI_DEVICE_ERROR;
 }
 
 /**
@@ -263,7 +276,14 @@ UsbBootExecCmdWithRetry (
     return Status;
   }
 
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  // USB enumeration runs at the same TPL as keyboard callbacks. Do not
+  // hold that level for a minute while a medium keeps reporting NOT_READY.
+  // Leave a failed bind retryable through the on-demand diagnostic reconnect.
+  Status = gBS->SetTimer (TimeoutEvt, TimerRelative, EFI_TIMER_PERIOD_SECONDS (2));
+#else
   Status = gBS->SetTimer (TimeoutEvt, TimerRelative, EFI_TIMER_PERIOD_SECONDS (60));
+#endif
   if (EFI_ERROR (Status)) {
     goto EXIT;
   }
@@ -287,7 +307,7 @@ UsbBootExecCmdWithRetry (
 
     //
     // If the sense data shows the drive is not ready, we need execute the cmd again.
-    // We limit the upper boundary to 60 seconds.
+    // The timer above bounds retries; each transport command has its own timeout.
     //
     if (Status == EFI_NOT_READY) {
       continue;

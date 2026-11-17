@@ -346,16 +346,15 @@ UsbBotGetStatus (
       continue;
     }
 
-    if (Csw.Signature != USB_BOT_CSW_SIGNATURE) {
+    if ((Len != sizeof (Csw)) || (Csw.Signature != USB_BOT_CSW_SIGNATURE) ||
+        (Csw.Tag != UsbBot->CbwTag) || (Csw.DataResidue > TransLen) ||
+        (Csw.CmdStatus > USB_BOT_COMMAND_FAILED)) {
       //
       // CSW is invalid, so perform reset recovery
       //
-      Status = UsbBotResetDevice (UsbBot, FALSE);
-    } else if (Csw.CmdStatus == USB_BOT_COMMAND_ERROR) {
-      //
-      // Respond phase error also needs reset recovery
-      //
-      Status = UsbBotResetDevice (UsbBot, FALSE);
+      UsbBotResetDevice (UsbBot, FALSE);
+      Status = EFI_DEVICE_ERROR;
+      break;
     } else {
       *CmdStatus = Csw.CmdStatus;
       break;
@@ -404,6 +403,7 @@ UsbBotExecCommand (
 {
   USB_BOT_PROTOCOL  *UsbBot;
   EFI_STATUS        Status;
+  EFI_STATUS        DataStatus;
   UINTN             TransLen;
   UINT8             Result;
 
@@ -426,7 +426,7 @@ UsbBotExecCommand (
   // whether it succeeds or fails.
   //
   TransLen = (UINTN)DataLen;
-  UsbBotDataTransfer (UsbBot, DataDir, Data, &TransLen, Timeout);
+  DataStatus = UsbBotDataTransfer (UsbBot, DataDir, Data, &TransLen, Timeout);
 
   //
   // Get the status, if that succeeds, interpret the result
@@ -438,6 +438,19 @@ UsbBotExecCommand (
   }
 
   if (Result == 0) {
+    if (EFI_ERROR (DataStatus)) {
+      return DataStatus;
+    }
+
+    // Fixed-size block reads must not succeed after a short USB transfer.
+    if ((TransLen != DataLen) &&
+        ((*(UINT8 *)Cmd == USB_BOOT_READ10_OPCODE) ||
+         (*(UINT8 *)Cmd == EFI_SCSI_OP_READ16) ||
+         (*(UINT8 *)Cmd == USB_BOOT_READ_CAPACITY_OPCODE) ||
+         (*(UINT8 *)Cmd == EFI_SCSI_OP_READ_CAPACITY16))) {
+      return EFI_DEVICE_ERROR;
+    }
+
     *CmdStatus = USB_MASS_CMD_SUCCESS;
   }
 

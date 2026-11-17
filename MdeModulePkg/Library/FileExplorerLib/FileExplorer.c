@@ -782,6 +782,10 @@ LibFindFileSystem (
   NoSimpleFsHandles = 0;
   OptionNumber      = 0;
 
+  // USB media can arrive after BDS completed its initial ConnectAll.
+  // Bind its block, partition and filesystem drivers before taking the list.
+  EfiBootManagerConnectAll ();
+
   //
   // Locate Handles that support Simple File System protocol
   //

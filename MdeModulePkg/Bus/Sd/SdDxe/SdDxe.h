@@ -82,6 +82,8 @@ typedef struct {
   BOOLEAN                                IsEnd;
 
   EFI_BLOCK_IO2_TOKEN                    *Token;
+  SD_DEVICE                              *Device;
+  BOOLEAN                                IsQueued;
 
   EFI_EVENT                              Event;
 } SD_REQUEST;
@@ -98,6 +100,9 @@ struct _SD_DEVICE {
   EFI_BLOCK_IO_PROTOCOL       BlockIo;
   EFI_BLOCK_IO2_PROTOCOL      BlockIo2;
   EFI_BLOCK_IO_MEDIA          BlockMedia;
+  BOOLEAN                     MediaInvalidated;
+  BOOLEAN                     ResetInProgress;
+  UINT32                      ActiveOperations;
   EFI_ERASE_BLOCK_PROTOCOL    EraseBlock;
   EFI_DISK_INFO_PROTOCOL      DiskInfo;
 
@@ -115,6 +120,9 @@ struct _SD_DEVICE {
   //
   CHAR16                      ModelName[SD_MODEL_NAME_MAX_LEN];
   SD_DRIVER_PRIVATE_DATA      *Private;
+  LIST_ENTRY                  ChildLink;
+  BOOLEAN                     ChildTracked;
+  BOOLEAN                     StopInProgress;
 };
 
 //
@@ -125,7 +133,35 @@ struct _SD_DRIVER_PRIVATE_DATA {
   EFI_HANDLE                       Controller;
   EFI_DEVICE_PATH_PROTOCOL         *ParentDevicePath;
   EFI_HANDLE                       DriverBindingHandle;
+  UINTN                            ChildCount;
+  LIST_ENTRY                       Children;
 };
+
+/**
+  Mark a child media instance unavailable exactly once. This tombstone cannot be
+  cleared; a fresh SD_DEVICE must be created after the old child is removed.
+**/
+VOID
+SdInvalidateMedia (
+  IN SD_DEVICE  *Device
+  );
+
+/**
+  Invalidate media when called from an event already running at TPL_NOTIFY.
+**/
+VOID
+SdInvalidateMediaAtNotify (
+  IN SD_DEVICE  *Device
+  );
+
+/**
+  Return whether a transport status means that the current child media is gone
+  or changed.
+**/
+BOOLEAN
+SdMediaUnavailableStatus (
+  IN EFI_STATUS  Status
+  );
 
 /**
   Tests to see if this driver supports a given controller. If a child device is provided,

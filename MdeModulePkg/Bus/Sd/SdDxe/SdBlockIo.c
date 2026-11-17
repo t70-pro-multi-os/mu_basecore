@@ -9,6 +9,268 @@
 #include "SdDxe.h"
 
 /**
+  Check the media ID and latched state as one TPL-protected observation.
+**/
+static EFI_STATUS
+SdValidateMediaId (
+  IN SD_DEVICE  *Device,
+  IN UINT32     MediaId
+  )
+{
+  EFI_STATUS  Status;
+  EFI_TPL     OldTpl;
+
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  if (MediaId != Device->BlockMedia.MediaId) {
+    Status = EFI_MEDIA_CHANGED;
+  } else if (Device->MediaInvalidated || !Device->BlockMedia.MediaPresent) {
+    Status = EFI_NO_MEDIA;
+  } else {
+    Status = EFI_SUCCESS;
+  }
+
+  gBS->RestoreTPL (OldTpl);
+  return Status;
+}
+
+/**
+  Convert the PassThru no-slot status to the Block I/O no-media status.
+**/
+static EFI_STATUS
+SdNormalizeMediaStatus (
+  IN EFI_STATUS  Status
+  )
+{
+  return (Status == EFI_NOT_FOUND) ? EFI_NO_MEDIA : Status;
+}
+
+/**
+  Reuse PassThru BuildDevicePath as a readiness probe. Success never refreshes
+  a child's identity or geometry.
+**/
+static EFI_STATUS
+SdCheckMediaReady (
+  IN SD_DEVICE  *Device,
+  IN BOOLEAN    Probe
+  )
+{
+  EFI_STATUS                Status;
+  EFI_DEVICE_PATH_PROTOCOL  *DevicePath;
+  EFI_TPL                   OldTpl;
+
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  if (Device->MediaInvalidated || !Device->BlockMedia.MediaPresent) {
+    gBS->RestoreTPL (OldTpl);
+    return EFI_NO_MEDIA;
+  }
+
+  gBS->RestoreTPL (OldTpl);
+  if (!Probe) {
+    OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+    if (Device->MediaInvalidated || !Device->BlockMedia.MediaPresent) {
+      Status = EFI_NO_MEDIA;
+    } else {
+      Status = EFI_SUCCESS;
+    }
+
+    gBS->RestoreTPL (OldTpl);
+    return Status;
+  }
+
+  DevicePath = NULL;
+  Status = Device->Private->PassThru->BuildDevicePath (
+             Device->Private->PassThru,
+             Device->Slot,
+             &DevicePath
+             );
+  if (EFI_ERROR (Status)) {
+    if (DevicePath != NULL) {
+      FreePool (DevicePath);
+    }
+
+    if ((Status == EFI_NO_MEDIA) || (Status == EFI_NOT_FOUND) ||
+        (Status == EFI_MEDIA_CHANGED)) {
+      SdInvalidateMedia (Device);
+    }
+
+    return SdNormalizeMediaStatus (Status);
+  }
+
+  if ((DevicePath == NULL) ||
+      (DevicePath->Type != MESSAGING_DEVICE_PATH) ||
+      (DevicePath->SubType != MSG_SD_DP) ||
+      (DevicePathNodeLength (DevicePath) != sizeof (SD_DEVICE_PATH)) ||
+      (((SD_DEVICE_PATH *)DevicePath)->SlotNumber != Device->Slot)) {
+    if (DevicePath != NULL) {
+      FreePool (DevicePath);
+    }
+
+    return EFI_DEVICE_ERROR;
+  }
+
+  FreePool (DevicePath);
+
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  if (Device->MediaInvalidated || !Device->BlockMedia.MediaPresent) {
+    Status = EFI_NO_MEDIA;
+  } else {
+    Status = EFI_SUCCESS;
+  }
+
+  gBS->RestoreTPL (OldTpl);
+  return Status;
+}
+
+/**
+  Pin a public I/O call before reading child state or probing the slot.
+**/
+static EFI_STATUS
+SdBeginOperation (
+  IN SD_DEVICE  *Device,
+  IN BOOLEAN    CheckMediaId,
+  IN UINT32     MediaId
+  )
+{
+  EFI_STATUS  Status;
+  EFI_TPL     OldTpl;
+
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  if (CheckMediaId && (MediaId != Device->BlockMedia.MediaId)) {
+    Status = EFI_MEDIA_CHANGED;
+  } else if (Device->MediaInvalidated || !Device->BlockMedia.MediaPresent) {
+    Status = EFI_NO_MEDIA;
+  } else if (Device->ResetInProgress || (Device->ActiveOperations == MAX_UINT32)) {
+    Status = EFI_NOT_READY;
+  } else {
+    Device->ActiveOperations++;
+    Status = EFI_SUCCESS;
+  }
+
+  gBS->RestoreTPL (OldTpl);
+  return Status;
+}
+
+/**
+  Release a public I/O call pin.
+**/
+static VOID
+SdEndOperation (
+  IN SD_DEVICE  *Device
+  )
+{
+  EFI_TPL  OldTpl;
+
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  ASSERT (Device->ActiveOperations != 0);
+  if (Device->ActiveOperations != 0) {
+    Device->ActiveOperations--;
+  }
+
+  gBS->RestoreTPL (OldTpl);
+}
+
+/**
+  Add a request only if media invalidation/Stop has not closed admission.
+**/
+static EFI_STATUS
+SdEnqueueRequest (
+  IN SD_DEVICE   *Device,
+  IN SD_REQUEST  *Request
+  )
+{
+  EFI_STATUS  Status;
+  EFI_TPL     OldTpl;
+
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  if (Device->MediaInvalidated || !Device->BlockMedia.MediaPresent) {
+    Status = EFI_NO_MEDIA;
+  } else if (Device->ResetInProgress) {
+    Status = EFI_NOT_READY;
+  } else {
+    Request->Device = Device;
+    InsertTailList (&Device->Queue, &Request->Link);
+    Request->IsQueued = TRUE;
+    Status = EFI_SUCCESS;
+  }
+
+  gBS->RestoreTPL (OldTpl);
+  return Status;
+}
+
+/**
+  Remove a request from its owner's queue exactly once.
+**/
+static VOID
+SdDequeueRequest (
+  IN SD_DEVICE   *Device,
+  IN SD_REQUEST  *Request
+  )
+{
+  EFI_TPL  OldTpl;
+
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  if (Request->IsQueued) {
+    RemoveEntryList (&Request->Link);
+    Request->IsQueued = FALSE;
+  }
+
+  gBS->RestoreTPL (OldTpl);
+}
+
+static VOID
+SdInvalidateMediaOnStatus (
+  IN SD_DEVICE   *Device,
+  IN EFI_STATUS  Status
+  )
+{
+  if (SdMediaUnavailableStatus (Status)) {
+    SdInvalidateMedia (Device);
+  }
+}
+
+static EFI_STATUS
+SdBeginReset (
+  IN SD_DEVICE  *Device
+  )
+{
+  EFI_STATUS  Status;
+  EFI_TPL     OldTpl;
+
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  if (Device->MediaInvalidated || !Device->BlockMedia.MediaPresent) {
+    Status = EFI_NO_MEDIA;
+  } else if (Device->ResetInProgress || (Device->ActiveOperations > 1) ||
+             !IsListEmpty (&Device->Queue)) {
+    Status = EFI_NOT_READY;
+  } else {
+    Device->ResetInProgress = TRUE;
+    Status = EFI_SUCCESS;
+  }
+
+  gBS->RestoreTPL (OldTpl);
+  return Status;
+}
+
+static EFI_STATUS
+SdEndReset (
+  IN SD_DEVICE   *Device,
+  IN EFI_STATUS  Status
+  )
+{
+  EFI_TPL  OldTpl;
+
+  SdInvalidateMediaOnStatus (Device, Status);
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  Device->ResetInProgress = FALSE;
+  if ((Status == EFI_SUCCESS) && Device->MediaInvalidated) {
+    Status = EFI_NO_MEDIA;
+  }
+
+  gBS->RestoreTPL (OldTpl);
+  return Status;
+}
+
+/**
   Nonblocking I/O callback function when the event is signaled.
 
   @param[in]  Event     The Event this notify function registered to.
@@ -28,6 +290,9 @@ AsyncIoCallback (
   gBS->CloseEvent (Event);
 
   Request = (SD_REQUEST *)Context;
+  if (SdMediaUnavailableStatus (Request->Packet.TransactionStatus)) {
+    SdInvalidateMediaAtNotify (Request->Device);
+  }
 
   DEBUG_CODE_BEGIN ();
   DEBUG ((
@@ -40,10 +305,15 @@ AsyncIoCallback (
   DEBUG_CODE_END ();
 
   if (EFI_ERROR (Request->Packet.TransactionStatus)) {
-    Request->Token->TransactionStatus = Request->Packet.TransactionStatus;
+    Request->Token->TransactionStatus = SdNormalizeMediaStatus (Request->Packet.TransactionStatus);
   }
 
-  RemoveEntryList (&Request->Link);
+  // This event runs at TPL_NOTIFY. Remove the queue pin directly so we do not
+  // attempt to raise to the same TPL from inside the callback.
+  if (Request->IsQueued) {
+    RemoveEntryList (&Request->Link);
+    Request->IsQueued = FALSE;
+  }
 
   if (Request->IsEnd) {
     gBS->SignalEvent (Request->Token->Event);
@@ -328,9 +598,10 @@ SdRwSingleBlock (
   EFI_STATUS                     Status;
   EFI_SD_MMC_PASS_THRU_PROTOCOL  *PassThru;
   SD_REQUEST                     *RwSingleBlkReq;
-  EFI_TPL                        OldTpl;
+  BOOLEAN                         IsAsync;
 
   RwSingleBlkReq = NULL;
+  IsAsync = (BOOLEAN)((Token != NULL) && (Token->Event != NULL));
   PassThru       = Device->Private->PassThru;
 
   RwSingleBlkReq = AllocateZeroPool (sizeof (SD_REQUEST));
@@ -340,9 +611,10 @@ SdRwSingleBlock (
   }
 
   RwSingleBlkReq->Signature = SD_REQUEST_SIGNATURE;
-  OldTpl                    = gBS->RaiseTPL (TPL_NOTIFY);
-  InsertTailList (&Device->Queue, &RwSingleBlkReq->Link);
-  gBS->RestoreTPL (OldTpl);
+  Status = SdEnqueueRequest (Device, RwSingleBlkReq);
+  if (EFI_ERROR (Status)) {
+    goto Error;
+  }
   RwSingleBlkReq->Packet.SdMmcCmdBlk    = &RwSingleBlkReq->SdMmcCmdBlk;
   RwSingleBlkReq->Packet.SdMmcStatusBlk = &RwSingleBlkReq->SdMmcStatusBlk;
   //
@@ -379,7 +651,7 @@ SdRwSingleBlock (
   RwSingleBlkReq->IsEnd = IsEnd;
   RwSingleBlkReq->Token = Token;
 
-  if ((Token != NULL) && (Token->Event != NULL)) {
+  if (IsAsync) {
     Status = gBS->CreateEvent (
                     EVT_NOTIFY_SIGNAL,
                     TPL_NOTIFY,
@@ -397,15 +669,13 @@ SdRwSingleBlock (
   Status = PassThru->PassThru (PassThru, Device->Slot, &RwSingleBlkReq->Packet, RwSingleBlkReq->Event);
 
 Error:
-  if ((Token != NULL) && (Token->Event != NULL)) {
+  if (IsAsync) {
     //
     // For asynchronous operation, only free request and event in error case.
     // The request and event will be freed in asynchronous callback for success case.
     //
     if (EFI_ERROR (Status) && (RwSingleBlkReq != NULL)) {
-      OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
-      RemoveEntryList (&RwSingleBlkReq->Link);
-      gBS->RestoreTPL (OldTpl);
+      SdDequeueRequest (Device, RwSingleBlkReq);
       if (RwSingleBlkReq->Event != NULL) {
         gBS->CloseEvent (RwSingleBlkReq->Event);
       }
@@ -417,9 +687,7 @@ Error:
     // For synchronous operation, free request whatever the execution result is.
     //
     if (RwSingleBlkReq != NULL) {
-      OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
-      RemoveEntryList (&RwSingleBlkReq->Link);
-      gBS->RestoreTPL (OldTpl);
+      SdDequeueRequest (Device, RwSingleBlkReq);
       FreePool (RwSingleBlkReq);
     }
   }
@@ -459,10 +727,11 @@ SdRwMultiBlocks (
 {
   EFI_STATUS                     Status;
   SD_REQUEST                     *RwMultiBlkReq;
+  BOOLEAN                         IsAsync;
   EFI_SD_MMC_PASS_THRU_PROTOCOL  *PassThru;
-  EFI_TPL                        OldTpl;
 
   RwMultiBlkReq = NULL;
+  IsAsync = (BOOLEAN)((Token != NULL) && (Token->Event != NULL));
 
   PassThru = Device->Private->PassThru;
 
@@ -473,9 +742,10 @@ SdRwMultiBlocks (
   }
 
   RwMultiBlkReq->Signature = SD_REQUEST_SIGNATURE;
-  OldTpl                   = gBS->RaiseTPL (TPL_NOTIFY);
-  InsertTailList (&Device->Queue, &RwMultiBlkReq->Link);
-  gBS->RestoreTPL (OldTpl);
+  Status = SdEnqueueRequest (Device, RwMultiBlkReq);
+  if (EFI_ERROR (Status)) {
+    goto Error;
+  }
   RwMultiBlkReq->Packet.SdMmcCmdBlk    = &RwMultiBlkReq->SdMmcCmdBlk;
   RwMultiBlkReq->Packet.SdMmcStatusBlk = &RwMultiBlkReq->SdMmcStatusBlk;
   //
@@ -512,7 +782,7 @@ SdRwMultiBlocks (
   RwMultiBlkReq->IsEnd = IsEnd;
   RwMultiBlkReq->Token = Token;
 
-  if ((Token != NULL) && (Token->Event != NULL)) {
+  if (IsAsync) {
     Status = gBS->CreateEvent (
                     EVT_NOTIFY_SIGNAL,
                     TPL_NOTIFY,
@@ -530,15 +800,13 @@ SdRwMultiBlocks (
   Status = PassThru->PassThru (PassThru, Device->Slot, &RwMultiBlkReq->Packet, RwMultiBlkReq->Event);
 
 Error:
-  if ((Token != NULL) && (Token->Event != NULL)) {
+  if (IsAsync) {
     //
     // For asynchronous operation, only free request and event in error case.
     // The request and event will be freed in asynchronous callback for success case.
     //
     if (EFI_ERROR (Status) && (RwMultiBlkReq != NULL)) {
-      OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
-      RemoveEntryList (&RwMultiBlkReq->Link);
-      gBS->RestoreTPL (OldTpl);
+      SdDequeueRequest (Device, RwMultiBlkReq);
       if (RwMultiBlkReq->Event != NULL) {
         gBS->CloseEvent (RwMultiBlkReq->Event);
       }
@@ -550,9 +818,7 @@ Error:
     // For synchronous operation, free request whatever the execution result is.
     //
     if (RwMultiBlkReq != NULL) {
-      OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
-      RemoveEntryList (&RwMultiBlkReq->Link);
-      gBS->RestoreTPL (OldTpl);
+      SdDequeueRequest (Device, RwMultiBlkReq);
       FreePool (RwMultiBlkReq);
     }
   }
@@ -583,8 +849,8 @@ Error:
                                 or the buffer is not on proper alignment.
 
 **/
-EFI_STATUS
-SdReadWrite (
+static EFI_STATUS
+SdReadWriteInternal (
   IN     SD_DEVICE            *Device,
   IN     UINT32               MediaId,
   IN     EFI_LBA              Lba,
@@ -602,13 +868,23 @@ SdReadWrite (
   UINTN               Remaining;
   UINT32              MaxBlock;
   BOOLEAN             LastRw;
+  EFI_EVENT           CallerEvent;
+  BOOLEAN             IsAsync;
 
   Status = EFI_SUCCESS;
   Media  = &Device->BlockMedia;
   LastRw = FALSE;
+  CallerEvent = (Token == NULL) ? NULL : Token->Event;
+  IsAsync     = (BOOLEAN)(CallerEvent != NULL);
 
-  if (MediaId != Media->MediaId) {
-    return EFI_MEDIA_CHANGED;
+  Status = SdValidateMediaId (Device, MediaId);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = SdCheckMediaReady (Device, (BOOLEAN)!IsAsync);
+  if (EFI_ERROR (Status)) {
+    return Status;
   }
 
   if (!IsRead && Media->ReadOnly) {
@@ -623,9 +899,9 @@ SdReadWrite (
   }
 
   if (BufferSize == 0) {
-    if ((Token != NULL) && (Token->Event != NULL)) {
+    if (IsAsync) {
       Token->TransactionStatus = EFI_SUCCESS;
-      gBS->SignalEvent (Token->Event);
+      gBS->SignalEvent (CallerEvent);
     }
 
     return EFI_SUCCESS;
@@ -646,7 +922,7 @@ SdReadWrite (
     return EFI_INVALID_PARAMETER;
   }
 
-  if ((Token != NULL) && (Token->Event != NULL)) {
+  if (IsAsync) {
     Token->TransactionStatus = EFI_SUCCESS;
   }
 
@@ -672,7 +948,8 @@ SdReadWrite (
     }
 
     if (EFI_ERROR (Status)) {
-      return Status;
+      SdInvalidateMediaOnStatus (Device, Status);
+      return SdNormalizeMediaStatus (Status);
     }
 
     DEBUG ((
@@ -681,7 +958,7 @@ SdReadWrite (
       IsRead ? "Read" : "Write",
       Lba,
       BlockNum,
-      (Token != NULL) ? Token->Event : NULL,
+      CallerEvent,
       Status
       ));
     Lba       += BlockNum;
@@ -689,6 +966,29 @@ SdReadWrite (
     Remaining -= BlockNum;
   }
 
+  return Status;
+}
+
+EFI_STATUS
+SdReadWrite (
+  IN     SD_DEVICE            *Device,
+  IN     UINT32               MediaId,
+  IN     EFI_LBA              Lba,
+  IN OUT VOID                 *Buffer,
+  IN     UINTN                BufferSize,
+  IN     BOOLEAN              IsRead,
+  IN OUT EFI_BLOCK_IO2_TOKEN  *Token
+  )
+{
+  EFI_STATUS  Status;
+
+  Status = SdBeginOperation (Device, TRUE, MediaId);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = SdReadWriteInternal (Device, MediaId, Lba, Buffer, BufferSize, IsRead, Token);
+  SdEndOperation (Device);
   return Status;
 }
 
@@ -703,9 +1003,9 @@ SdReadWrite (
                                not be reset.
 
 **/
-EFI_STATUS
+static EFI_STATUS
 EFIAPI
-SdReset (
+SdResetInternal (
   IN  EFI_BLOCK_IO_PROTOCOL  *This,
   IN  BOOLEAN                ExtendedVerification
   )
@@ -715,13 +1015,44 @@ SdReset (
   EFI_SD_MMC_PASS_THRU_PROTOCOL  *PassThru;
 
   Device = SD_DEVICE_DATA_FROM_BLKIO (This);
-
   PassThru = Device->Private->PassThru;
-  Status   = PassThru->ResetDevice (PassThru, Device->Slot);
+  Status = SdCheckMediaReady (Device, TRUE);
   if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = SdBeginReset (Device);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = PassThru->ResetDevice (PassThru, Device->Slot);
+  Status = SdEndReset (Device, Status);
+  Status = SdNormalizeMediaStatus (Status);
+  if (EFI_ERROR (Status) && !SdMediaUnavailableStatus (Status)) {
     Status = EFI_DEVICE_ERROR;
   }
 
+  return Status;
+}
+EFI_STATUS
+EFIAPI
+SdReset (
+  IN  EFI_BLOCK_IO_PROTOCOL  *This,
+  IN  BOOLEAN                ExtendedVerification
+  )
+{
+  EFI_STATUS  Status;
+  SD_DEVICE   *Device;
+
+  Device = SD_DEVICE_DATA_FROM_BLKIO (This);
+  Status = SdBeginOperation (Device, FALSE, 0);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = SdResetInternal (This, ExtendedVerification);
+  SdEndOperation (Device);
   return Status;
 }
 
@@ -818,10 +1149,18 @@ SdFlushBlocks (
   IN  EFI_BLOCK_IO_PROTOCOL  *This
   )
 {
-  //
-  // return directly
-  //
-  return EFI_SUCCESS;
+  EFI_STATUS  Status;
+  SD_DEVICE   *Device;
+
+  Device = SD_DEVICE_DATA_FROM_BLKIO (This);
+  Status = SdBeginOperation (Device, FALSE, 0);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = SdCheckMediaReady (Device, TRUE);
+  SdEndOperation (Device);
+  return Status;
 }
 
 /**
@@ -835,6 +1174,35 @@ SdFlushBlocks (
                                    not be reset.
 
 **/
+static EFI_STATUS
+EFIAPI
+SdResetExInternal (
+  IN  EFI_BLOCK_IO2_PROTOCOL  *This,
+  IN  BOOLEAN                 ExtendedVerification
+  )
+{
+  EFI_STATUS  Status;
+  EFI_TPL     OldTpl;
+  SD_DEVICE   *Device;
+
+  Device = SD_DEVICE_DATA_FROM_BLKIO2 (This);
+  Status = SdCheckMediaReady (Device, TRUE);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  if (Device->MediaInvalidated || !Device->BlockMedia.MediaPresent) {
+    Status = EFI_NO_MEDIA;
+  } else if (Device->ResetInProgress || !IsListEmpty (&Device->Queue)) {
+    Status = EFI_NOT_READY;
+  } else {
+    Status = EFI_SUCCESS;
+  }
+
+  gBS->RestoreTPL (OldTpl);
+  return Status;
+}
 EFI_STATUS
 EFIAPI
 SdResetEx (
@@ -842,37 +1210,32 @@ SdResetEx (
   IN  BOOLEAN                 ExtendedVerification
   )
 {
-  SD_DEVICE   *Device;
-  LIST_ENTRY  *Link;
-  LIST_ENTRY  *NextLink;
-  SD_REQUEST  *Request;
+  EFI_STATUS  Status;
   EFI_TPL     OldTpl;
+  SD_DEVICE   *Device;
 
   Device = SD_DEVICE_DATA_FROM_BLKIO2 (This);
 
+  // DiskIoDxe resets BlockIo2 while disconnecting this child. Stop has already
+  // invalidated the media and drained its I/O, so no card access is needed.
+  // Returning NO_MEDIA here would prevent DiskIo/FAT from releasing the child.
   OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
-  for (Link = GetFirstNode (&Device->Queue);
-       !IsNull (&Device->Queue, Link);
-       Link = NextLink)
-  {
-    NextLink = GetNextNode (&Device->Queue, Link);
-    RemoveEntryList (Link);
-
-    Request = SD_REQUEST_FROM_LINK (Link);
-
-    gBS->CloseEvent (Request->Event);
-    Request->Token->TransactionStatus = EFI_ABORTED;
-
-    if (Request->IsEnd) {
-      gBS->SignalEvent (Request->Token->Event);
-    }
-
-    FreePool (Request);
+  if (Device->StopInProgress) {
+    Status = ((Device->ActiveOperations == 0) && !Device->ResetInProgress &&
+              IsListEmpty (&Device->Queue)) ? EFI_SUCCESS : EFI_NOT_READY;
+    gBS->RestoreTPL (OldTpl);
+    return Status;
   }
 
   gBS->RestoreTPL (OldTpl);
+  Status = SdBeginOperation (Device, FALSE, 0);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
 
-  return EFI_SUCCESS;
+  Status = SdResetExInternal (This, ExtendedVerification);
+  SdEndOperation (Device);
+  return Status;
 }
 
 /**
@@ -981,15 +1344,32 @@ SdFlushBlocksEx (
   IN OUT EFI_BLOCK_IO2_TOKEN     *Token
   )
 {
-  //
-  // Signal event and return directly.
-  //
-  if ((Token != NULL) && (Token->Event != NULL)) {
-    Token->TransactionStatus = EFI_SUCCESS;
-    gBS->SignalEvent (Token->Event);
+  EFI_STATUS  Status;
+  SD_DEVICE   *Device;
+
+  Device = SD_DEVICE_DATA_FROM_BLKIO2 (This);
+  Status = SdBeginOperation (Device, FALSE, 0);
+  if (EFI_ERROR (Status)) {
+    if (Token != NULL) {
+      Token->TransactionStatus = Status;
+      if (Token->Event != NULL) {
+        gBS->SignalEvent (Token->Event);
+      }
+    }
+
+    return Status;
   }
 
-  return EFI_SUCCESS;
+  Status = SdCheckMediaReady (Device, (BOOLEAN)((Token == NULL) || (Token->Event == NULL)));
+  if (Token != NULL) {
+    Token->TransactionStatus = Status;
+    if (Token->Event != NULL) {
+      gBS->SignalEvent (Token->Event);
+    }
+  }
+
+  SdEndOperation (Device);
+  return Status;
 }
 
 /**
@@ -1017,9 +1397,10 @@ SdEraseBlockStart (
   EFI_STATUS                     Status;
   EFI_SD_MMC_PASS_THRU_PROTOCOL  *PassThru;
   SD_REQUEST                     *EraseBlockStart;
-  EFI_TPL                        OldTpl;
+  BOOLEAN                         IsAsync;
 
   EraseBlockStart = NULL;
+  IsAsync = (BOOLEAN)((Token != NULL) && (Token->Event != NULL));
   PassThru        = Device->Private->PassThru;
 
   EraseBlockStart = AllocateZeroPool (sizeof (SD_REQUEST));
@@ -1029,9 +1410,10 @@ SdEraseBlockStart (
   }
 
   EraseBlockStart->Signature = SD_REQUEST_SIGNATURE;
-  OldTpl                     = gBS->RaiseTPL (TPL_NOTIFY);
-  InsertTailList (&Device->Queue, &EraseBlockStart->Link);
-  gBS->RestoreTPL (OldTpl);
+  Status = SdEnqueueRequest (Device, EraseBlockStart);
+  if (EFI_ERROR (Status)) {
+    goto Error;
+  }
   EraseBlockStart->Packet.SdMmcCmdBlk    = &EraseBlockStart->SdMmcCmdBlk;
   EraseBlockStart->Packet.SdMmcStatusBlk = &EraseBlockStart->SdMmcStatusBlk;
   EraseBlockStart->Packet.Timeout        = SD_GENERIC_TIMEOUT;
@@ -1049,7 +1431,7 @@ SdEraseBlockStart (
   EraseBlockStart->IsEnd = IsEnd;
   EraseBlockStart->Token = Token;
 
-  if ((Token != NULL) && (Token->Event != NULL)) {
+  if (IsAsync) {
     Status = gBS->CreateEvent (
                     EVT_NOTIFY_SIGNAL,
                     TPL_NOTIFY,
@@ -1067,15 +1449,13 @@ SdEraseBlockStart (
   Status = PassThru->PassThru (PassThru, Device->Slot, &EraseBlockStart->Packet, EraseBlockStart->Event);
 
 Error:
-  if ((Token != NULL) && (Token->Event != NULL)) {
+  if (IsAsync) {
     //
     // For asynchronous operation, only free request and event in error case.
     // The request and event will be freed in asynchronous callback for success case.
     //
     if (EFI_ERROR (Status) && (EraseBlockStart != NULL)) {
-      OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
-      RemoveEntryList (&EraseBlockStart->Link);
-      gBS->RestoreTPL (OldTpl);
+      SdDequeueRequest (Device, EraseBlockStart);
       if (EraseBlockStart->Event != NULL) {
         gBS->CloseEvent (EraseBlockStart->Event);
       }
@@ -1087,9 +1467,7 @@ Error:
     // For synchronous operation, free request whatever the execution result is.
     //
     if (EraseBlockStart != NULL) {
-      OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
-      RemoveEntryList (&EraseBlockStart->Link);
-      gBS->RestoreTPL (OldTpl);
+      SdDequeueRequest (Device, EraseBlockStart);
       FreePool (EraseBlockStart);
     }
   }
@@ -1122,9 +1500,10 @@ SdEraseBlockEnd (
   EFI_STATUS                     Status;
   EFI_SD_MMC_PASS_THRU_PROTOCOL  *PassThru;
   SD_REQUEST                     *EraseBlockEnd;
-  EFI_TPL                        OldTpl;
+  BOOLEAN                         IsAsync;
 
   EraseBlockEnd = NULL;
+  IsAsync = (BOOLEAN)((Token != NULL) && (Token->Event != NULL));
   PassThru      = Device->Private->PassThru;
 
   EraseBlockEnd = AllocateZeroPool (sizeof (SD_REQUEST));
@@ -1134,9 +1513,10 @@ SdEraseBlockEnd (
   }
 
   EraseBlockEnd->Signature = SD_REQUEST_SIGNATURE;
-  OldTpl                   = gBS->RaiseTPL (TPL_NOTIFY);
-  InsertTailList (&Device->Queue, &EraseBlockEnd->Link);
-  gBS->RestoreTPL (OldTpl);
+  Status = SdEnqueueRequest (Device, EraseBlockEnd);
+  if (EFI_ERROR (Status)) {
+    goto Error;
+  }
   EraseBlockEnd->Packet.SdMmcCmdBlk    = &EraseBlockEnd->SdMmcCmdBlk;
   EraseBlockEnd->Packet.SdMmcStatusBlk = &EraseBlockEnd->SdMmcStatusBlk;
   EraseBlockEnd->Packet.Timeout        = SD_GENERIC_TIMEOUT;
@@ -1154,7 +1534,7 @@ SdEraseBlockEnd (
   EraseBlockEnd->IsEnd = IsEnd;
   EraseBlockEnd->Token = Token;
 
-  if ((Token != NULL) && (Token->Event != NULL)) {
+  if (IsAsync) {
     Status = gBS->CreateEvent (
                     EVT_NOTIFY_SIGNAL,
                     TPL_NOTIFY,
@@ -1172,15 +1552,13 @@ SdEraseBlockEnd (
   Status = PassThru->PassThru (PassThru, Device->Slot, &EraseBlockEnd->Packet, EraseBlockEnd->Event);
 
 Error:
-  if ((Token != NULL) && (Token->Event != NULL)) {
+  if (IsAsync) {
     //
     // For asynchronous operation, only free request and event in error case.
     // The request and event will be freed in asynchronous callback for success case.
     //
     if (EFI_ERROR (Status) && (EraseBlockEnd != NULL)) {
-      OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
-      RemoveEntryList (&EraseBlockEnd->Link);
-      gBS->RestoreTPL (OldTpl);
+      SdDequeueRequest (Device, EraseBlockEnd);
       if (EraseBlockEnd->Event != NULL) {
         gBS->CloseEvent (EraseBlockEnd->Event);
       }
@@ -1192,9 +1570,7 @@ Error:
     // For synchronous operation, free request whatever the execution result is.
     //
     if (EraseBlockEnd != NULL) {
-      OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
-      RemoveEntryList (&EraseBlockEnd->Link);
-      gBS->RestoreTPL (OldTpl);
+      SdDequeueRequest (Device, EraseBlockEnd);
       FreePool (EraseBlockEnd);
     }
   }
@@ -1225,9 +1601,10 @@ SdEraseBlock (
   EFI_STATUS                     Status;
   EFI_SD_MMC_PASS_THRU_PROTOCOL  *PassThru;
   SD_REQUEST                     *EraseBlock;
-  EFI_TPL                        OldTpl;
+  BOOLEAN                         IsAsync;
 
   EraseBlock = NULL;
+  IsAsync = (BOOLEAN)((Token != NULL) && (Token->Event != NULL));
   PassThru   = Device->Private->PassThru;
 
   EraseBlock = AllocateZeroPool (sizeof (SD_REQUEST));
@@ -1237,9 +1614,10 @@ SdEraseBlock (
   }
 
   EraseBlock->Signature = SD_REQUEST_SIGNATURE;
-  OldTpl                = gBS->RaiseTPL (TPL_NOTIFY);
-  InsertTailList (&Device->Queue, &EraseBlock->Link);
-  gBS->RestoreTPL (OldTpl);
+  Status = SdEnqueueRequest (Device, EraseBlock);
+  if (EFI_ERROR (Status)) {
+    goto Error;
+  }
   EraseBlock->Packet.SdMmcCmdBlk    = &EraseBlock->SdMmcCmdBlk;
   EraseBlock->Packet.SdMmcStatusBlk = &EraseBlock->SdMmcStatusBlk;
   EraseBlock->Packet.Timeout        = SD_GENERIC_TIMEOUT;
@@ -1251,7 +1629,7 @@ SdEraseBlock (
   EraseBlock->IsEnd = IsEnd;
   EraseBlock->Token = Token;
 
-  if ((Token != NULL) && (Token->Event != NULL)) {
+  if (IsAsync) {
     Status = gBS->CreateEvent (
                     EVT_NOTIFY_SIGNAL,
                     TPL_NOTIFY,
@@ -1269,15 +1647,13 @@ SdEraseBlock (
   Status = PassThru->PassThru (PassThru, Device->Slot, &EraseBlock->Packet, EraseBlock->Event);
 
 Error:
-  if ((Token != NULL) && (Token->Event != NULL)) {
+  if (IsAsync) {
     //
     // For asynchronous operation, only free request and event in error case.
     // The request and event will be freed in asynchronous callback for success case.
     //
     if (EFI_ERROR (Status) && (EraseBlock != NULL)) {
-      OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
-      RemoveEntryList (&EraseBlock->Link);
-      gBS->RestoreTPL (OldTpl);
+      SdDequeueRequest (Device, EraseBlock);
       if (EraseBlock->Event != NULL) {
         gBS->CloseEvent (EraseBlock->Event);
       }
@@ -1289,9 +1665,7 @@ Error:
     // For synchronous operation, free request whatever the execution result is.
     //
     if (EraseBlock != NULL) {
-      OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
-      RemoveEntryList (&EraseBlock->Link);
-      gBS->RestoreTPL (OldTpl);
+      SdDequeueRequest (Device, EraseBlock);
       FreePool (EraseBlock);
     }
   }
@@ -1326,9 +1700,9 @@ Error:
   @retval EFI_MEDIA_CHANGED       The MediaId is not for the current media.
 
 **/
-EFI_STATUS
+static EFI_STATUS
 EFIAPI
-SdEraseBlocks (
+SdEraseBlocksInternal (
   IN     EFI_ERASE_BLOCK_PROTOCOL  *This,
   IN     UINT32                    MediaId,
   IN     EFI_LBA                   Lba,
@@ -1342,13 +1716,23 @@ SdEraseBlocks (
   UINTN               BlockNum;
   EFI_LBA             LastLba;
   SD_DEVICE           *Device;
+  EFI_EVENT           CallerEvent;
+  BOOLEAN             IsAsync;
 
   Status = EFI_SUCCESS;
   Device = SD_DEVICE_DATA_FROM_ERASEBLK (This);
+  CallerEvent = (Token == NULL) ? NULL : Token->Event;
+  IsAsync     = (BOOLEAN)(CallerEvent != NULL);
   Media  = &Device->BlockMedia;
 
-  if (MediaId != Media->MediaId) {
-    return EFI_MEDIA_CHANGED;
+  Status = SdValidateMediaId (Device, MediaId);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = SdCheckMediaReady (Device, (BOOLEAN)!IsAsync);
+  if (EFI_ERROR (Status)) {
+    return Status;
   }
 
   if (Media->ReadOnly) {
@@ -1368,7 +1752,7 @@ SdEraseBlocks (
     return EFI_INVALID_PARAMETER;
   }
 
-  if ((Token != NULL) && (Token->Event != NULL)) {
+  if (IsAsync) {
     Token->TransactionStatus = EFI_SUCCESS;
   }
 
@@ -1376,17 +1760,20 @@ SdEraseBlocks (
 
   Status = SdEraseBlockStart (Device, Lba, (EFI_BLOCK_IO2_TOKEN *)Token, FALSE);
   if (EFI_ERROR (Status)) {
-    return Status;
+    SdInvalidateMediaOnStatus (Device, Status);
+    return SdNormalizeMediaStatus (Status);
   }
 
   Status = SdEraseBlockEnd (Device, LastLba, (EFI_BLOCK_IO2_TOKEN *)Token, FALSE);
   if (EFI_ERROR (Status)) {
-    return Status;
+    SdInvalidateMediaOnStatus (Device, Status);
+    return SdNormalizeMediaStatus (Status);
   }
 
   Status = SdEraseBlock (Device, (EFI_BLOCK_IO2_TOKEN *)Token, TRUE);
   if (EFI_ERROR (Status)) {
-    return Status;
+    SdInvalidateMediaOnStatus (Device, Status);
+    return SdNormalizeMediaStatus (Status);
   }
 
   DEBUG ((
@@ -1394,9 +1781,33 @@ SdEraseBlocks (
     "SdEraseBlocks(): Lba 0x%x BlkNo 0x%x Event %p with %r\n",
     Lba,
     BlockNum,
-    (Token != NULL) ? Token->Event : NULL,
+    CallerEvent,
     Status
     ));
 
+  return Status;
+}
+
+EFI_STATUS
+EFIAPI
+SdEraseBlocks (
+  IN     EFI_ERASE_BLOCK_PROTOCOL  *This,
+  IN     UINT32                    MediaId,
+  IN     EFI_LBA                   Lba,
+  IN OUT EFI_ERASE_BLOCK_TOKEN     *Token,
+  IN     UINTN                     Size
+  )
+{
+  EFI_STATUS  Status;
+  SD_DEVICE   *Device;
+
+  Device = SD_DEVICE_DATA_FROM_ERASEBLK (This);
+  Status = SdBeginOperation (Device, TRUE, MediaId);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = SdEraseBlocksInternal (This, MediaId, Lba, Token, Size);
+  SdEndOperation (Device);
   return Status;
 }

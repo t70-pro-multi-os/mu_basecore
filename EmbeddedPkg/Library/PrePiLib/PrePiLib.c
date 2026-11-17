@@ -67,19 +67,39 @@ LoadPeCoffImage (
   PE_COFF_LOADER_IMAGE_CONTEXT  ImageContext;
   VOID                          *Buffer;
 
+  // Error paths are reachable in RELEASE builds where ASSERT is disabled.
+  // Do not publish uninitialized load addresses or execute a failed image.
+  if ((PeCoffImage == NULL) || (ImageAddress == NULL) ||
+      (ImageSize == NULL) || (EntryPoint == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  *ImageAddress = 0;
+  *ImageSize    = 0;
+  *EntryPoint   = 0;
   ZeroMem (&ImageContext, sizeof (ImageContext));
 
   ImageContext.Handle    = PeCoffImage;
   ImageContext.ImageRead = PeCoffLoaderImageReadFromMemory;
 
   Status = PeCoffLoaderGetImageInfo (&ImageContext);
-  ASSERT_EFI_ERROR (Status);
+  if (RETURN_ERROR (Status)) {
+    return (EFI_STATUS)Status;
+  }
+
+  // The PrePi image path below historically uses a 32-bit page count input.
+  // Reject an empty or truncated size before allocating or touching the image.
+  if ((ImageContext.ImageSize == 0) || (ImageContext.ImageSize > MAX_UINT32)) {
+    return EFI_UNSUPPORTED;
+  }
 
   //
   // Allocate Memory for the image
   //
   Buffer = AllocateCodePages (EFI_SIZE_TO_PAGES ((UINT32)ImageContext.ImageSize));
-  ASSERT (Buffer != 0);
+  if (Buffer == NULL) {
+    return EFI_OUT_OF_RESOURCES;
+  }
 
   ImageContext.ImageAddress = (EFI_PHYSICAL_ADDRESS)(UINTN)Buffer;
 
@@ -87,13 +107,18 @@ LoadPeCoffImage (
   // Load the image to our new buffer
   //
   Status = PeCoffLoaderLoadImage (&ImageContext);
-  ASSERT_EFI_ERROR (Status);
+  if (RETURN_ERROR (Status)) {
+    // PrePi cannot free pages. Keep this buffer reserved and stop the load.
+    return (EFI_STATUS)Status;
+  }
 
   //
   // Relocate the image in our new buffer
   //
   Status = PeCoffLoaderRelocateImage (&ImageContext);
-  ASSERT_EFI_ERROR (Status);
+  if (RETURN_ERROR (Status)) {
+    return (EFI_STATUS)Status;
+  }
 
   *ImageAddress = ImageContext.ImageAddress;
   *ImageSize    = ImageContext.ImageSize;
@@ -138,13 +163,17 @@ LoadDxeCoreFromFfsFile (
 
   Status = LoadPeCoffImage (PeCoffImage, &ImageAddress, &ImageSize, &EntryPoint);
   // For NT32 Debug  Status = SecWinNtPeiLoadFile (PeCoffImage, &ImageAddress, &ImageSize, &EntryPoint);
-  ASSERT_EFI_ERROR (Status);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
 
   //
   // Extract the DxeCore GUID file name.
   //
   Status = FfsGetFileInfo (FileHandle, &FvFileInfo);
-  ASSERT_EFI_ERROR (Status);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
 
   BuildModuleHob (&FvFileInfo.FileName, (EFI_PHYSICAL_ADDRESS)(UINTN)ImageAddress, EFI_SIZE_TO_PAGES ((UINT32)ImageSize) * EFI_PAGE_SIZE, EntryPoint);
 

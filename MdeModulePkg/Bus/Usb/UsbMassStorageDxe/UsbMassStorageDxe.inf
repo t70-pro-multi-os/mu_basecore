@@ -40,6 +40,7 @@
 #
 
 [Sources]
+  T70UsbStorageDiagnostics.c
   UsbMassBoot.h
   UsbMassImpl.h
   UsbMassBot.h

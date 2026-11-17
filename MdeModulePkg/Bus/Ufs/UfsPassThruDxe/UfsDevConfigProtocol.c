@@ -31,9 +31,9 @@
   @retval EFI_DEVICE_ERROR      The device descriptor is not read/written successfully.
 
 **/
+STATIC
 EFI_STATUS
-EFIAPI
-UfsRwUfsDescriptor (
+UfsRwUfsDescriptorInternal (
   IN EFI_UFS_DEVICE_CONFIG_PROTOCOL  *This,
   IN BOOLEAN                         Read,
   IN UINT8                           DescId,
@@ -86,9 +86,9 @@ UfsRwUfsDescriptor (
   @retval EFI_DEVICE_ERROR      The flag is not set/clear successfully.
 
 **/
+STATIC
 EFI_STATUS
-EFIAPI
-UfsRwUfsFlag (
+UfsRwUfsFlagInternal (
   IN EFI_UFS_DEVICE_CONFIG_PROTOCOL  *This,
   IN BOOLEAN                         Read,
   IN UINT8                           FlagId,
@@ -135,9 +135,9 @@ UfsRwUfsFlag (
   @retval EFI_DEVICE_ERROR      The attribute is not read/written successfully.
 
 **/
+STATIC
 EFI_STATUS
-EFIAPI
-UfsRwUfsAttribute (
+UfsRwUfsAttributeInternal (
   IN EFI_UFS_DEVICE_CONFIG_PROTOCOL  *This,
   IN BOOLEAN                         Read,
   IN UINT8                           AttrId,
@@ -189,5 +189,92 @@ UfsRwUfsAttribute (
     }
   }
 
+  return Status;
+}
+
+EFI_STATUS
+EFIAPI
+UfsRwUfsDescriptor (
+  IN EFI_UFS_DEVICE_CONFIG_PROTOCOL  *This,
+  IN BOOLEAN                         Read,
+  IN UINT8                           DescId,
+  IN UINT8                           Index,
+  IN UINT8                           Selector,
+  IN OUT UINT8                       *Descriptor,
+  IN OUT UINT32                      *DescSize
+  )
+{
+  EFI_STATUS                  Status;
+  UFS_PASS_THRU_PRIVATE_DATA  *Private;
+
+  if (This == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Private = UFS_PASS_THRU_PRIVATE_DATA_FROM_DEV_CONFIG (This);
+  Status  = UfsEnterCall (Private, FALSE, FALSE);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = UfsRwUfsDescriptorInternal (This, Read, DescId, Index, Selector, Descriptor, DescSize);
+  UfsLeaveCall (Private);
+  return Status;
+}
+
+EFI_STATUS
+EFIAPI
+UfsRwUfsFlag (
+  IN EFI_UFS_DEVICE_CONFIG_PROTOCOL  *This,
+  IN BOOLEAN                         Read,
+  IN UINT8                           FlagId,
+  IN OUT UINT8                       *Flag
+  )
+{
+  EFI_STATUS                  Status;
+  UFS_PASS_THRU_PRIVATE_DATA  *Private;
+
+  if (This == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Private = UFS_PASS_THRU_PRIVATE_DATA_FROM_DEV_CONFIG (This);
+  Status  = UfsEnterCall (Private, FALSE, FALSE);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = UfsRwUfsFlagInternal (This, Read, FlagId, Flag);
+  UfsLeaveCall (Private);
+  return Status;
+}
+
+EFI_STATUS
+EFIAPI
+UfsRwUfsAttribute (
+  IN EFI_UFS_DEVICE_CONFIG_PROTOCOL  *This,
+  IN BOOLEAN                         Read,
+  IN UINT8                           AttrId,
+  IN UINT8                           Index,
+  IN UINT8                           Selector,
+  IN OUT UINT8                       *Attribute,
+  IN OUT UINT32                      *AttrSize
+  )
+{
+  EFI_STATUS                  Status;
+  UFS_PASS_THRU_PRIVATE_DATA  *Private;
+
+  if (This == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Private = UFS_PASS_THRU_PRIVATE_DATA_FROM_DEV_CONFIG (This);
+  Status  = UfsEnterCall (Private, FALSE, FALSE);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = UfsRwUfsAttributeInternal (This, Read, AttrId, Index, Selector, Attribute, AttrSize);
+  UfsLeaveCall (Private);
   return Status;
 }

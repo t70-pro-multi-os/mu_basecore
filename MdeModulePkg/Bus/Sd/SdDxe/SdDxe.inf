@@ -41,6 +41,7 @@
 
 [Packages]
   MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
 
 [LibraryClasses]
   DevicePathLib
@@ -51,6 +52,10 @@
   BaseLib
   UefiDriverEntryPoint
   DebugLib
+  PcdLib
+
+[FixedPcd]
+  gEfiMdeModulePkgTokenSpaceGuid.PcdSdDxeReadOnly ## CONSUMES
 
 [Protocols]
   gEfiSdMmcPassThruProtocolGuid                ## TO_START

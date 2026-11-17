@@ -371,6 +371,9 @@ UsbMassInitMedia (
   Media->WriteCaching     = FALSE;
   Media->IoAlign          = 0;
   Media->MediaId          = 1;
+  // An empty direct-access card reader must still publish BlockIO so a
+  // later card insertion can be detected. Capacity replaces this placeholder.
+  Media->BlockSize        = 512;
 
   Status = UsbBootGetParams (UsbMass);
   DEBUG ((DEBUG_INFO, "UsbMassInitMedia: UsbBootGetParams (%r)\n", Status));
@@ -827,7 +830,9 @@ USBMassDriverBindingStart (
   Context   = NULL;
   MaxLun    = 0;
 
+  T70UsbStorageDiagnostic (Controller, 1, EFI_NOT_READY, 0, 0, 0, 0, 0, 0);
   Status = UsbMassInitTransport (This, Controller, &Transport, &Context, &MaxLun);
+  T70UsbStorageDiagnostic (Controller, 2, Status, 0, MaxLun, 0, 0, 0, 0);
 
   if (EFI_ERROR (Status)) {
     DEBUG ((DEBUG_ERROR, "USBMassDriverBindingStart: UsbMassInitTransport (%r)\n", Status));
@@ -903,6 +908,7 @@ USBMassDriverBindingStart (
   }
 
 Exit:
+  T70UsbStorageDiagnostic (Controller, 5, Status, 0, 0, 0, 0, 0, 0);
   gBS->RestoreTPL (OldTpl);
   return Status;
 }
@@ -1124,6 +1130,7 @@ USBMassStorageEntryPoint (
              &gUsbMassStorageComponentName2
              );
   ASSERT_EFI_ERROR (Status);
+  if (!EFI_ERROR (Status)) T70UsbStorageDiagnosticInit (ImageHandle);
 
-  return EFI_SUCCESS;
+  return Status;
 }

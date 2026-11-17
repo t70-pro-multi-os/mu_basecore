@@ -308,6 +308,24 @@ FdtCheckHeader (
   );
 
 /**
+  Validate the complete Flattened Device Tree within a bounded buffer.
+
+  Checks the header, reservation map, structure and property names. Callers
+  must ensure that BufferSize bytes are readable at Fdt before calling.
+
+  @param[in] Fdt         Pointer to the FDT blob.
+  @param[in] BufferSize  Number of readable bytes at Fdt.
+
+  @return Zero on success, otherwise a negative libfdt error code.
+**/
+INT32
+EFIAPI
+FdtCheckFull (
+  IN CONST VOID  *Fdt,
+  IN UINTN       BufferSize
+  );
+
+/**
   Unpack FDT blob into new buffer
 
   @param[in]  Fdt            The pointer to FDT blob.

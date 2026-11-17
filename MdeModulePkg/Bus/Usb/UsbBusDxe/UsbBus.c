@@ -318,7 +318,7 @@ UsbIoBulkTransfer (
         Dev->Bus->Devices[Dev->Translator.TranslatorHubAddress],
         Dev->Translator.TranslatorPortNumber,
         Dev->Address,
-        0,
+        Endpoint,
         USB_ENDPOINT_BULK
         );
     }

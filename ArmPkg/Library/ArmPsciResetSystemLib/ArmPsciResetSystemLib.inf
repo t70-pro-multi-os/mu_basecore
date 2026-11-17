@@ -16,6 +16,7 @@
   MODULE_TYPE                    = BASE
   VERSION_STRING                 = 1.0
   LIBRARY_CLASS                  = ResetSystemLib
+  LIBRARY_CLASS                  = HwResetSystemLib
   CONSTRUCTOR                    = ArmPsciResetSystemLibConstructor
 
 [Sources]

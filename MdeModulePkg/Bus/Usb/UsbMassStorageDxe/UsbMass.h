@@ -181,3 +181,14 @@ struct _USB_MASS_DEVICE {
   USB_BOOT_INQUIRY_DATA       InquiryData;
   BOOLEAN                     Cdb16Byte;
 };
+
+#ifdef T70PRO_RAM_DIAGNOSTICS
+VOID T70UsbStorageDiagnosticInit (EFI_HANDLE Image);
+VOID T70UsbStorageDiagnostic (EFI_HANDLE Controller, UINT32 Stage,
+  EFI_STATUS Status, UINT8 Opcode, UINT8 Lun, UINT32 Result,
+  UINT8 Key, UINT8 Asc, UINT8 Ascq);
+#else
+#define T70UsbStorageDiagnosticInit(Image) do { } while (0)
+#define T70UsbStorageDiagnostic(C,S,E,O,L,R,K,A,Q) do { } while (0)
+#endif
+

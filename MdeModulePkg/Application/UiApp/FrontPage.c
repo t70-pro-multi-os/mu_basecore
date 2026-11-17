@@ -8,7 +8,50 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
 **/
 
 #include "FrontPage.h"
+#ifdef T70PRO_RAM_DIAGNOSTICS
+#include <Pi/PiFirmwareFile.h>
+#include <Library/DxeServicesLib.h>
+STATIC EFI_GUID mDeviceCheckGuid = {0x5d2d4f70,0x9b16,0x47b8,{0x90,0xdc,0xa5,0xb1,0xc6,0x64,0x78,0xd2}};
+STATIC VOID LaunchDeviceCheck (VOID) {
+  EFI_DEVICE_PATH_PROTOCOL *Path = NULL;
+  EFI_HANDLE Image = NULL;
+  EFI_STATUS Status = GetFileDevicePathFromAnyFv (&mDeviceCheckGuid, EFI_SECTION_PE32, 0, &Path);
+  if (!EFI_ERROR (Status)) {
+    Status = gBS->LoadImage (FALSE, gImageHandle, Path, NULL, 0, &Image);
+    FreePool (Path);
+    if (!EFI_ERROR (Status)) Status = gBS->StartImage (Image, NULL, NULL);
+    else if (Image != NULL) gBS->UnloadImage (Image);
+  }
+  if (EFI_ERROR (Status)) Print (L"Device Check: %r\r\n", Status);
+}
+#endif
 #include "FrontPageCustomizedUi.h"
+
+
+#ifdef T70PRO_RAM_DIAGNOSTICS
+#include <Library/IoLib.h>
+#include <Library/CacheMaintenanceLib.h>
+STATIC VOID RecordT70SetupPhase (UINT32 Stage)
+{
+  UINT32 Sequence;
+  if (MmioRead64 (0x43F7F000) != 0x0000000148303754ULL ||
+      MmioRead64 (0x43F7F060) != 0x0000000147503754ULL ||
+      MmioRead32 (0x43F7F068) != 8 ||
+      MmioRead64 (0x43F7F800) != 0x000000074C443754ULL ||
+      MmioRead32 (0x43F7F808) != 0x43F7F060U ||
+      MmioRead32 (0x43F7F80C) != 0) return;
+  Sequence = MmioRead32 (0x43F7F814);
+  if (Sequence < 65535U) Sequence++;
+  MmioWrite64 (0x43F7F800, 0);
+  MmioWrite32 (0x43F7F810, Stage);
+  MmioWrite32 (0x43F7F814, Sequence);
+  MemoryFence ();
+  MmioWrite64 (0x43F7F800, 0x000000074C443754ULL);
+  WriteBackDataCacheRange ((VOID *)(UINTN)0x43F7F800, 72);
+}
+#else
+#define RecordT70SetupPhase(Stage) do { } while (0)
+#endif
 
 #define MAX_STRING_LEN  200
 
@@ -181,6 +224,15 @@ FrontPageCallback (
   OUT EFI_BROWSER_ACTION_REQUEST            *ActionRequest
   )
 {
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  if (QuestionId == 0x10f0) {
+    if (Action != EFI_BROWSER_ACTION_CHANGED) return EFI_UNSUPPORTED;
+    if (ActionRequest == NULL) return EFI_INVALID_PARAMETER;
+    LaunchDeviceCheck ();
+    *ActionRequest = EFI_BROWSER_ACTION_REQUEST_NONE;
+    return EFI_SUCCESS;
+  }
+#endif
   return UiFrontPageCallbackHandler (gFrontPagePrivate.HiiHandle, Action, QuestionId, Type, Value, ActionRequest);
 }
 
@@ -235,6 +287,12 @@ UpdateFrontPageForm (
     StartOpCodeHandle
     );
 
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  HiiCreateActionOpCode (StartOpCodeHandle, 0x10f0,
+    HiiSetString (gFrontPagePrivate.HiiHandle, 0, L"Device Check", NULL),
+    HiiSetString (gFrontPagePrivate.HiiHandle, 0, L"Inspect USB, storage and input without a boot disk", NULL),
+    EFI_IFR_FLAG_CALLBACK, 0);
+#endif
   HiiUpdateForm (
     gFrontPagePrivate.HiiHandle,
     &mFrontPageGuid,
@@ -335,6 +393,7 @@ CallFrontPage (
     );
 
   ActionRequest = EFI_BROWSER_ACTION_REQUEST_NONE;
+  RecordT70SetupPhase (10);
   Status        = gFormBrowser2->SendForm (
                                    gFormBrowser2,
                                    &gFrontPagePrivate.HiiHandle,
@@ -344,6 +403,7 @@ CallFrontPage (
                                    NULL,
                                    &ActionRequest
                                    );
+  RecordT70SetupPhase (11);
   //
   // Check whether user change any option setting which needs a reset to be effective
   //
@@ -379,6 +439,7 @@ FreeFrontPage (
   // Publish our HII data
   //
   HiiRemovePackages (gFrontPagePrivate.HiiHandle);
+
   if (gFrontPagePrivate.LanguageToken != NULL) {
     FreePool (gFrontPagePrivate.LanguageToken);
     gFrontPagePrivate.LanguageToken = NULL;
@@ -915,6 +976,7 @@ InitializeUserInterface (
   UINTN                            BootTextColumn;
   UINTN                            BootTextRow;
 
+  RecordT70SetupPhase (9);
   if (!mModeInitialized) {
     //
     // After the console is ready, get current video resolution
@@ -1038,9 +1100,7 @@ UiEntry (
   }
 
   InitializeFrontPage ();
-
   CallFrontPage ();
-
   FreeFrontPage ();
 
   //

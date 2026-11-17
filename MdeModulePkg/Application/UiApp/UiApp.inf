@@ -39,6 +39,7 @@
   MdeModulePkg/MdeModulePkg.dec
 
 [LibraryClasses]
+  DxeServicesLib
   DevicePathLib
   BaseLib
   UefiRuntimeServicesTableLib
@@ -47,6 +48,8 @@
   UefiLib
   UefiBootServicesTableLib
   BaseMemoryLib
+  IoLib
+  CacheMaintenanceLib
   DebugLib
   PrintLib
   HiiLib
