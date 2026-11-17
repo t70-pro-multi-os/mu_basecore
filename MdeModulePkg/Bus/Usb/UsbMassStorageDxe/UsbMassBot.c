@@ -484,6 +484,7 @@ UsbBotResetDevice (
   USB_BOT_PROTOCOL        *UsbBot;
   EFI_USB_DEVICE_REQUEST  Request;
   EFI_STATUS              Status;
+  EFI_STATUS              OutStatus;
   UINT32                  Result;
   UINT32                  Timeout;
 
@@ -524,10 +525,11 @@ UsbBotResetDevice (
   //
   // Clear the Bulk-In and Bulk-Out stall condition.
   //
-  UsbClearEndpointStall (UsbBot->UsbIo, UsbBot->BulkInEndpoint->EndpointAddress);
-  UsbClearEndpointStall (UsbBot->UsbIo, UsbBot->BulkOutEndpoint->EndpointAddress);
+  Status    = UsbClearEndpointStall (UsbBot->UsbIo, UsbBot->BulkInEndpoint->EndpointAddress);
+  OutStatus = UsbClearEndpointStall (UsbBot->UsbIo, UsbBot->BulkOutEndpoint->EndpointAddress);
 
-  return Status;
+  // Complete both clears in order, but never report a partial recovery as success.
+  return EFI_ERROR (Status) ? Status : OutStatus;
 }
 
 /**
