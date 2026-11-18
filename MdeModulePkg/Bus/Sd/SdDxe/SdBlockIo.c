@@ -1749,7 +1749,8 @@ SdEraseBlocksInternal (
   }
 
   BlockNum = Size / BlockSize;
-  if ((Lba + BlockNum - 1) > Media->LastBlock) {
+  if ((Lba > Media->LastBlock) ||
+      ((BlockNum - 1) > (Media->LastBlock - Lba))) {
     return EFI_INVALID_PARAMETER;
   }
 
