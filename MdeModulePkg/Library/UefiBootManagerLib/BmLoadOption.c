@@ -1188,14 +1188,9 @@ EfiBootManagerGetLoadOptions (
       FreePool (OptionOrder);
     }
 
+    // Keep the allocated capacity after filtering. Shrinking is optional and
+    // must not lose valid options or free the already released OptionOrder.
     if (OptionIndex < *OptionCount) {
-      Options = ReallocatePool (*OptionCount * sizeof (EFI_BOOT_MANAGER_LOAD_OPTION), OptionIndex * sizeof (EFI_BOOT_MANAGER_LOAD_OPTION), Options);
-      if (Options == NULL) {
-        ASSERT (Options != NULL);
-        FreePool (OptionOrder);
-        return NULL;
-      }
-
       *OptionCount = OptionIndex;
     }
   } else if (LoadOptionType == LoadOptionTypePlatformRecovery) {
