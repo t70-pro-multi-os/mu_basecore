@@ -1220,7 +1220,10 @@ GraphicsConsoleConOutSetMode (
   EFI_GRAPHICS_OUTPUT_BLT_PIXEL  *NewLineBuffer;
   EFI_GRAPHICS_OUTPUT_PROTOCOL   *GraphicsOutput;
   EFI_TPL                        OldTpl;
+  BOOLEAN                        CursorFlushed;
 
+  NewLineBuffer = NULL;
+  CursorFlushed = FALSE;
   OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
 
   Private        = GRAPHICS_CONSOLE_CON_OUT_DEV_FROM_THIS (This);
@@ -1252,18 +1255,9 @@ GraphicsConsoleConOutSetMode (
       //
       // Clear the current text window on the current graphics console
       //
-      This->ClearScreen (This);
-      Status = EFI_SUCCESS;
+      Status = This->ClearScreen (This);
       goto Done;
     }
-
-    //
-    // Otherwise, the size of the text console and/or the GOP mode will be changed,
-    // so erase the cursor, and free the LineBuffer for the current mode
-    //
-    FlushCursor (This);
-
-    FreePool (Private->LineBuffer);
   }
 
   //
@@ -1281,10 +1275,14 @@ GraphicsConsoleConOutSetMode (
     goto Done;
   }
 
-  //
-  // Assign the current line buffer to the newly allocated line buffer
-  //
-  Private->LineBuffer = NewLineBuffer;
+  // Keep the old allocation and mode valid until the new GOP mode succeeds.
+  if (Private->LineBuffer != NULL) {
+    Status = FlushCursor (This);
+    if (EFI_ERROR (Status)) {
+      goto Done;
+    }
+    CursorFlushed = TRUE;
+  }
 
   if (GraphicsOutput != NULL) {
     if (ModeData->GopModeNumber != GraphicsOutput->Mode->Mode) {
@@ -1318,6 +1316,9 @@ GraphicsConsoleConOutSetMode (
                                    ModeData->GopHeight,
                                    0
                                    );
+        if (EFI_ERROR (Status)) {
+          goto Done;
+        }
       }
 
       // END
@@ -1327,6 +1328,11 @@ GraphicsConsoleConOutSetMode (
   //
   // The new mode is valid, so commit the mode change
   //
+  if (Private->LineBuffer != NULL) {
+    FreePool (Private->LineBuffer);
+  }
+  Private->LineBuffer = NewLineBuffer;
+  NewLineBuffer = NULL;
   This->Mode->Mode = (INT32)ModeNumber;
 
   //
@@ -1340,6 +1346,13 @@ GraphicsConsoleConOutSetMode (
   Status = EFI_SUCCESS;
 
 Done:
+  if (NewLineBuffer != NULL) {
+    FreePool (NewLineBuffer);
+    if (CursorFlushed) {
+      // Best effort restore after a failed transition; preserve its error.
+      FlushCursor (This);
+    }
+  }
   // MU_CHANGE
   // MU_CHANGE - Used to prevent screen clear first time through.
   mClearScreen = TRUE;
