@@ -270,6 +270,41 @@ SdEndReset (
   return Status;
 }
 
+/** Release one batch reference at TPL_NOTIFY, notifying only after all owners end. **/
+static VOID
+SdReleaseBatchAtNotify (
+  IN SD_IO_BATCH  *Batch,
+  IN EFI_STATUS   Status
+  )
+{
+  EFI_EVENT Event;
+  if (Batch == NULL) { return; }
+  if (EFI_ERROR (Status) && !EFI_ERROR (Batch->Status)) { Batch->Status = Status; }
+  ASSERT (Batch->References != 0);
+  if (--Batch->References != 0) { return; }
+  Event = NULL;
+  if (Batch->Accepted) {
+    Batch->Token->TransactionStatus = Batch->Status;
+    Event = Batch->Token->Event;
+  }
+  FreePool (Batch);
+  if (Event != NULL) { gBS->SignalEvent (Event); }
+}
+
+static VOID
+SdAttachBatch (
+  IN SD_REQUEST   *Request,
+  IN SD_IO_BATCH  *Batch
+  )
+{
+  EFI_TPL OldTpl;
+  if (Batch == NULL) { return; }
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  Batch->References++;
+  Request->Batch = Batch;
+  gBS->RestoreTPL (OldTpl);
+}
+
 /**
   Nonblocking I/O callback function when the event is signaled.
 
@@ -304,7 +339,7 @@ AsyncIoCallback (
     ));
   DEBUG_CODE_END ();
 
-  if (EFI_ERROR (Request->Packet.TransactionStatus)) {
+  if ((Request->Batch == NULL) && EFI_ERROR (Request->Packet.TransactionStatus)) {
     Request->Token->TransactionStatus = SdNormalizeMediaStatus (Request->Packet.TransactionStatus);
   }
 
@@ -313,6 +348,14 @@ AsyncIoCallback (
   if (Request->IsQueued) {
     RemoveEntryList (&Request->Link);
     Request->IsQueued = FALSE;
+  }
+
+  if (Request->Batch != NULL) {
+    SD_IO_BATCH *Batch = Request->Batch;
+    EFI_STATUS Status = SdNormalizeMediaStatus (Request->Packet.TransactionStatus);
+    FreePool (Request);
+    SdReleaseBatchAtNotify (Batch, Status);
+    return;
   }
 
   if (Request->IsEnd) {
@@ -592,7 +635,8 @@ SdRwSingleBlock (
   IN  UINTN                BufferSize,
   IN  BOOLEAN              IsRead,
   IN  EFI_BLOCK_IO2_TOKEN  *Token,
-  IN  BOOLEAN              IsEnd
+  IN  BOOLEAN              IsEnd,
+  IN  SD_IO_BATCH          *Batch
   )
 {
   EFI_STATUS                     Status;
@@ -666,6 +710,7 @@ SdRwSingleBlock (
     RwSingleBlkReq->Event = NULL;
   }
 
+  SdAttachBatch (RwSingleBlkReq, Batch);
   Status = PassThru->PassThru (PassThru, Device->Slot, &RwSingleBlkReq->Packet, RwSingleBlkReq->Event);
 
 Error:
@@ -680,6 +725,11 @@ Error:
         gBS->CloseEvent (RwSingleBlkReq->Event);
       }
 
+      if (RwSingleBlkReq->Batch != NULL) {
+        EFI_TPL OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+        SdReleaseBatchAtNotify (RwSingleBlkReq->Batch, SdNormalizeMediaStatus (Status));
+        gBS->RestoreTPL (OldTpl);
+      }
       FreePool (RwSingleBlkReq);
     }
   } else {
@@ -722,7 +772,8 @@ SdRwMultiBlocks (
   IN  UINTN                BufferSize,
   IN  BOOLEAN              IsRead,
   IN  EFI_BLOCK_IO2_TOKEN  *Token,
-  IN  BOOLEAN              IsEnd
+  IN  BOOLEAN              IsEnd,
+  IN  SD_IO_BATCH          *Batch
   )
 {
   EFI_STATUS                     Status;
@@ -797,6 +848,7 @@ SdRwMultiBlocks (
     RwMultiBlkReq->Event = NULL;
   }
 
+  SdAttachBatch (RwMultiBlkReq, Batch);
   Status = PassThru->PassThru (PassThru, Device->Slot, &RwMultiBlkReq->Packet, RwMultiBlkReq->Event);
 
 Error:
@@ -811,6 +863,11 @@ Error:
         gBS->CloseEvent (RwMultiBlkReq->Event);
       }
 
+      if (RwMultiBlkReq->Batch != NULL) {
+        EFI_TPL OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+        SdReleaseBatchAtNotify (RwMultiBlkReq->Batch, SdNormalizeMediaStatus (Status));
+        gBS->RestoreTPL (OldTpl);
+      }
       FreePool (RwMultiBlkReq);
     }
   } else {
@@ -870,6 +927,8 @@ SdReadWriteInternal (
   BOOLEAN             LastRw;
   EFI_EVENT           CallerEvent;
   BOOLEAN             IsAsync;
+  SD_IO_BATCH         *Batch;
+  EFI_TPL             OldTpl;
 
   Status = EFI_SUCCESS;
   Media  = &Device->BlockMedia;
@@ -923,7 +982,13 @@ SdReadWriteInternal (
     return EFI_INVALID_PARAMETER;
   }
 
+  Batch = NULL;
   if (IsAsync) {
+    Batch = AllocateZeroPool (sizeof (*Batch));
+    if (Batch == NULL) { return EFI_OUT_OF_RESOURCES; }
+    Batch->References = 1; // Submission owner survives immediate callbacks.
+    Batch->Token = Token;
+    Batch->Status = EFI_SUCCESS;
     Token->TransactionStatus = EFI_SUCCESS;
   }
 
@@ -943,14 +1008,22 @@ SdReadWriteInternal (
 
     BufferSize = BlockNum * BlockSize;
     if (BlockNum == 1) {
-      Status = SdRwSingleBlock (Device, Lba, Buffer, BufferSize, IsRead, Token, LastRw);
+      Status = SdRwSingleBlock (Device, Lba, Buffer, BufferSize, IsRead, Token, LastRw, Batch);
     } else {
-      Status = SdRwMultiBlocks (Device, Lba, Buffer, BufferSize, IsRead, Token, LastRw);
+      Status = SdRwMultiBlocks (Device, Lba, Buffer, BufferSize, IsRead, Token, LastRw, Batch);
     }
 
     if (EFI_ERROR (Status)) {
       SdInvalidateMediaOnStatus (Device, Status);
-      return SdNormalizeMediaStatus (Status);
+      Status = SdNormalizeMediaStatus (Status);
+      break;
+    }
+    if (Batch != NULL) {
+      OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+      Batch->Accepted = TRUE;
+      Status = Batch->Status;
+      gBS->RestoreTPL (OldTpl);
+      if (EFI_ERROR (Status)) { break; }
     }
 
     DEBUG ((
@@ -967,6 +1040,15 @@ SdReadWriteInternal (
     Remaining -= BlockNum;
   }
 
+  if (Batch != NULL) {
+    BOOLEAN Accepted;
+    OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+    Accepted = Batch->Accepted;
+    SdReleaseBatchAtNotify (Batch, Status);
+    gBS->RestoreTPL (OldTpl);
+    // Accepted commands retain caller memory until the single batch completion.
+    if (Accepted) { return EFI_SUCCESS; }
+  }
   return Status;
 }
 
@@ -982,14 +1064,24 @@ SdReadWrite (
   )
 {
   EFI_STATUS  Status;
+  EFI_EVENT   CompletionEvent;
+  BOOLEAN     Synchronous;
 
   Status = SdBeginOperation (Device, TRUE, MediaId);
   if (EFI_ERROR (Status)) {
     return Status;
   }
 
-  Status = SdReadWriteInternal (Device, MediaId, Lba, Buffer, BufferSize, IsRead, Token);
+  Synchronous = PcdGetBool (PcdSdDxeSynchronousPassThru);
+  CompletionEvent = (Synchronous && (Token != NULL)) ? Token->Event : NULL;
+  Status = SdReadWriteInternal (Device, MediaId, Lba, Buffer, BufferSize, IsRead,
+                               Synchronous ? NULL : Token);
   SdEndOperation (Device);
+  if ((CompletionEvent != NULL) && !EFI_ERROR (Status)) {
+    Token->TransactionStatus = Status;
+    // The caller may free Token and stop the device from this notification.
+    gBS->SignalEvent (CompletionEvent);
+  }
   return Status;
 }
 
@@ -1802,6 +1894,8 @@ SdEraseBlocks (
 {
   EFI_STATUS  Status;
   SD_DEVICE   *Device;
+  EFI_EVENT   CompletionEvent;
+  BOOLEAN     Synchronous;
 
   Device = SD_DEVICE_DATA_FROM_ERASEBLK (This);
   Status = SdBeginOperation (Device, TRUE, MediaId);
@@ -1809,7 +1903,13 @@ SdEraseBlocks (
     return Status;
   }
 
-  Status = SdEraseBlocksInternal (This, MediaId, Lba, Token, Size);
+  Synchronous = PcdGetBool (PcdSdDxeSynchronousPassThru);
+  CompletionEvent = (Synchronous && (Token != NULL)) ? Token->Event : NULL;
+  Status = SdEraseBlocksInternal (This, MediaId, Lba, Synchronous ? NULL : Token, Size);
   SdEndOperation (Device);
+  if ((CompletionEvent != NULL) && !EFI_ERROR (Status)) {
+    Token->TransactionStatus = Status;
+    gBS->SignalEvent (CompletionEvent);
+  }
   return Status;
 }

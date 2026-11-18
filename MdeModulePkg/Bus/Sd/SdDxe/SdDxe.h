@@ -68,6 +68,13 @@ extern EFI_COMPONENT_NAME2_PROTOCOL  gSdDxeComponentName2;
 typedef struct _SD_DEVICE               SD_DEVICE;
 typedef struct _SD_DRIVER_PRIVATE_DATA  SD_DRIVER_PRIVATE_DATA;
 
+typedef struct {
+  UINTN                References;
+  BOOLEAN              Accepted;
+  EFI_STATUS           Status;
+  EFI_BLOCK_IO2_TOKEN  *Token;
+} SD_IO_BATCH;
+
 //
 // Asynchronous I/O request.
 //
@@ -82,6 +89,7 @@ typedef struct {
   BOOLEAN                                IsEnd;
 
   EFI_BLOCK_IO2_TOKEN                    *Token;
+  SD_IO_BATCH                            *Batch;
   SD_DEVICE                              *Device;
   BOOLEAN                                IsQueued;
 

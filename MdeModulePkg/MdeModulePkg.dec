@@ -1159,6 +1159,9 @@
   # @Prompt SD media read-only policy.
   gEfiMdeModulePkgTokenSpaceGuid.PcdSdDxeReadOnly|FALSE|BOOLEAN|0x70006789
 
+  ## Submit SD commands synchronously; complete caller tokens in the bus driver.
+  gEfiMdeModulePkgTokenSpaceGuid.PcdSdDxeSynchronousPassThru|FALSE|BOOLEAN|0x7000678A
+
   ## Flag of enabling/disabling the feature of Loading Module at Fixed Address.<BR><BR>
   #  0xFFFFFFFFFFFFFFFF: Enable the feature as fixed offset to TOLM.<BR>
   #  0:                  Disable the feature.<BR>
