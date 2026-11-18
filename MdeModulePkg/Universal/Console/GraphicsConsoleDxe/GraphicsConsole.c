@@ -1530,12 +1530,15 @@ GraphicsConsoleConOutSetCursorPosition (
     goto Done;
   }
 
-  FlushCursor (This);
+  Status = FlushCursor (This);
+  if (EFI_ERROR (Status)) {
+    goto Done;
+  }
 
   This->Mode->CursorColumn = (INT32)Column;
   This->Mode->CursorRow    = (INT32)Row;
 
-  FlushCursor (This);
+  Status = FlushCursor (This);
 
 Done:
   gBS->RestoreTPL (OldTpl);
