@@ -2610,7 +2610,9 @@ EfiBootManagerRefreshAllBootOption (
   }
 
   NvBootOptions = EfiBootManagerGetLoadOptions (&NvBootOptionCount, LoadOptionTypeBoot);
-  if (NvBootOptions == NULL) {
+  // A missing BootOrder is an empty list, not a failure: still add discovered
+  // options on first boot. A nonzero count with NULL indicates allocation failure.
+  if ((NvBootOptions == NULL) && (NvBootOptionCount != 0)) {
     goto Exit;
   }
 
