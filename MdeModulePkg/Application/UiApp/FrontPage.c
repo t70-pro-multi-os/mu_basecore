@@ -31,6 +31,7 @@ STATIC VOID LaunchDeviceCheck (VOID) {
 #ifdef T70PRO_RAM_DIAGNOSTICS
 #include <Library/IoLib.h>
 #include <Library/CacheMaintenanceLib.h>
+#include "T70BootDiagnostic.h"
 STATIC VOID RecordT70SetupPhase (UINT32 Stage)
 {
   UINT32 Sequence;
@@ -279,6 +280,10 @@ UpdateFrontPageForm (
   EndGuidLabel->ExtendOpCode = EFI_IFR_EXTEND_OP_LABEL;
   EndGuidLabel->Number       = LABEL_END;
 
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  AppendT70BootDiagnostic (gFrontPagePrivate.HiiHandle, StartOpCodeHandle);
+#endif
+
   //
   // Updata Front Page form
   //
@@ -438,6 +443,9 @@ FreeFrontPage (
   //
   // Publish our HII data
   //
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  ResetT70DiagnosticStrings ();
+#endif
   HiiRemovePackages (gFrontPagePrivate.HiiHandle);
 
   if (gFrontPagePrivate.LanguageToken != NULL) {
