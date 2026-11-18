@@ -1747,6 +1747,8 @@ UfsPassThruDriverBindingStart (
                   &Private->TimerEvent
                   );
   if (EFI_ERROR (Status)) {
+    // No event ownership is transferred on failed creation.
+    Private->TimerEvent = NULL;
     DEBUG ((DEBUG_ERROR, "Ufs Create Async Tasks Event Error, Status = %r\n", Status));
     goto Error;
   }
