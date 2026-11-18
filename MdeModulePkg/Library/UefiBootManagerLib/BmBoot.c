@@ -732,7 +732,10 @@ BmExpandFileDevicePath (
         if (GetNext) {
           break;
         } else {
-          GetNext = (BOOLEAN)(CompareMem (NextFullPath, FullPath, GetDevicePathSize (NextFullPath)) == 0);
+          GetNext = (BOOLEAN)(
+                      (GetDevicePathSize (NextFullPath) == GetDevicePathSize (FullPath)) &&
+                      (CompareMem (NextFullPath, FullPath, GetDevicePathSize (NextFullPath)) == 0)
+                      );
           FreePool (NextFullPath);
           NextFullPath = NULL;
         }
