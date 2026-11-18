@@ -46,6 +46,7 @@ LocateFvInstanceWithTables (
   EFI_FIRMWARE_VOLUME2_PROTOCOL  *FvInstance;
 
   FvStatus = 0;
+  *Instance = NULL;
 
   //
   // Locate protocol.
@@ -71,14 +72,17 @@ LocateFvInstanceWithTables (
   for (Index = 0; Index < NumberOfHandles; Index++) {
     //
     // Get the protocol on this handle
-    // This should not fail because of LocateHandleBuffer
+    // Enumeration does not guarantee a later protocol lookup will succeed.
     //
     Status = gBS->HandleProtocol (
                     HandleBuffer[Index],
                     &gEfiFirmwareVolume2ProtocolGuid,
                     (VOID **)&FvInstance
                     );
-    ASSERT_EFI_ERROR (Status);
+    if (EFI_ERROR (Status)) {
+      // Failure does not provide a callable interface. Try the next FV.
+      continue;
+    }
 
     //
     // See if it has the ACPI storage file
