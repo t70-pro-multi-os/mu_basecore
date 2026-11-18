@@ -214,6 +214,9 @@ AcpiPlatformEntryPoint (
                       &FvStatus
                       );
     if (EFI_ERROR (Status)) {
+      // A failed read does not transfer ownership of its output buffer.
+      // Do not pass an undefined failure output to FreePool during rollback.
+      CurrentTable = NULL;
       if ((Status == EFI_NOT_FOUND) && (Instance != 0)) {
         break;
       }
