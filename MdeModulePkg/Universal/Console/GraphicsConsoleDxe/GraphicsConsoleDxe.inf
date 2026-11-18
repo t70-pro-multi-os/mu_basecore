@@ -34,6 +34,7 @@
   LaffStd.c
   GraphicsConsole.c
   GraphicsConsole.h
+  ConsoleScale.h
 
 [Packages]
   MdePkg/MdePkg.dec
