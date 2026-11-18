@@ -1165,6 +1165,7 @@ EfiBootManagerGetLoadOptions (
 
     Options = AllocatePool (*OptionCount * sizeof (EFI_BOOT_MANAGER_LOAD_OPTION));
     if (Options == NULL) {
+      FreePool (OptionOrder);
       ASSERT (Options != NULL);
       return NULL;
     }
