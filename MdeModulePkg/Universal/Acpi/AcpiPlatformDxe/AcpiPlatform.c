@@ -170,7 +170,15 @@ AcpiPlatformEntryPoint (
   UINT32                         FvStatus;
   UINTN                          TableSize;
   UINTN                          Size;
+  typedef struct TABLE_KEY_NODE {
+    struct TABLE_KEY_NODE  *Next;
+    UINTN                  Key;
+  } TABLE_KEY_NODE;
+  TABLE_KEY_NODE                 *Installed;
+  TABLE_KEY_NODE                 *Node;
+  EFI_STATUS                     RollbackStatus;
 
+  Installed    = NULL;
   Instance     = 0;
   CurrentTable = NULL;
   TableHandle  = 0;
@@ -191,10 +199,11 @@ AcpiPlatformEntryPoint (
     return EFI_ABORTED;
   }
 
-  //
-  // Read tables from the storage file.
-  //
-  while (Status == EFI_SUCCESS) {
+  // Keep the keys from this invocation only. A failed read/install must not
+  // leave a silently truncated platform table set behind.
+  for (;;) {
+    CurrentTable = NULL;
+    Size         = 0;
     Status = FwVol->ReadSection (
                       FwVol,
                       (EFI_GUID *)PcdGetPtr (PcdAcpiTableStorageFile),
@@ -204,49 +213,73 @@ AcpiPlatformEntryPoint (
                       &Size,
                       &FvStatus
                       );
-    if (!EFI_ERROR (Status)) {
-      //
-      // Add the table
-      //
-      TableHandle = 0;
-
-      TableSize = ((EFI_ACPI_DESCRIPTION_HEADER *)CurrentTable)->Length;
-      ASSERT (Size >= TableSize);
-
-      //
-      // Checksum ACPI table
-      //
-      AcpiPlatformChecksum ((UINT8 *)CurrentTable, TableSize);
-
-      //
-      // Install ACPI table
-      //
-      Status = AcpiTable->InstallAcpiTable (
-                            AcpiTable,
-                            CurrentTable,
-                            TableSize,
-                            &TableHandle
-                            );
-
-      //
-      // Free memory allocated by ReadSection
-      //
-      gBS->FreePool (CurrentTable);
-
-      if (EFI_ERROR (Status)) {
-        return EFI_ABORTED;
+    if (EFI_ERROR (Status)) {
+      if ((Status == EFI_NOT_FOUND) && (Instance != 0)) {
+        break;
       }
-
-      //
-      // Increment the instance
-      //
-      Instance++;
-      CurrentTable = NULL;
+      goto Failed;
     }
+
+    // Assertions are absent in RELEASE. Validate before reading the length
+    // or computing a checksum over an FV-supplied buffer.
+    if ((CurrentTable == NULL) || (Size < sizeof (EFI_ACPI_DESCRIPTION_HEADER))) {
+      Status = EFI_COMPROMISED_DATA;
+      goto Failed;
+    }
+    TableSize = ((EFI_ACPI_DESCRIPTION_HEADER *)CurrentTable)->Length;
+    if ((TableSize < sizeof (EFI_ACPI_DESCRIPTION_HEADER)) || (TableSize > Size)) {
+      Status = EFI_COMPROMISED_DATA;
+      goto Failed;
+    }
+
+    // Reserve bookkeeping before installation, so allocation failure cannot
+    // strand a successfully installed table without a rollback key.
+    Status = gBS->AllocatePool (EfiBootServicesData, sizeof (*Node), (VOID **)&Node);
+    if (EFI_ERROR (Status)) {
+      goto Failed;
+    }
+    AcpiPlatformChecksum ((UINT8 *)CurrentTable, TableSize);
+    TableHandle = 0;
+    Status = AcpiTable->InstallAcpiTable (AcpiTable, CurrentTable, TableSize, &TableHandle);
+    gBS->FreePool (CurrentTable);
+    CurrentTable = NULL;
+    if (EFI_ERROR (Status) && (TableHandle == 0)) {
+      gBS->FreePool (Node);
+      goto Failed;
+    }
+    // This AcpiTableDxe can assign a key before PublishTables fails. Include
+    // that key in rollback too; otherwise the failed install itself leaks.
+    Node->Key  = TableHandle;
+    Node->Next = Installed;
+    Installed  = Node;
+    if (EFI_ERROR (Status)) {
+      goto Failed;
+    }
+    Instance++;
   }
 
-  //
-  // The driver does not require to be kept loaded.
-  //
+  while (Installed != NULL) {
+    Node      = Installed;
+    Installed = Node->Next;
+    gBS->FreePool (Node);
+  }
   return EFI_REQUEST_UNLOAD_IMAGE;
+
+Failed:
+  if (CurrentTable != NULL) {
+    gBS->FreePool (CurrentTable);
+  }
+  // Reverse installation order, and attempt every removal even if one fails.
+  // A rollback failure is surfaced, never reported as successful cleanup.
+  while (Installed != NULL) {
+    Node           = Installed;
+    Installed      = Node->Next;
+    RollbackStatus = AcpiTable->UninstallAcpiTable (AcpiTable, Node->Key);
+    if (EFI_ERROR (RollbackStatus)) {
+      DEBUG ((DEBUG_ERROR, "ACPI platform rollback failed for key %Lu: %r\n", (UINT64)Node->Key, RollbackStatus));
+      Status = EFI_DEVICE_ERROR;
+    }
+    gBS->FreePool (Node);
+  }
+  return Status;
 }
