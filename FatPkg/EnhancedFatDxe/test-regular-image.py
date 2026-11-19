@@ -20,7 +20,9 @@ parser.add_argument('--sd-bridge',action='store_true',help='route actual FAT I/O
 parser.add_argument('--msdc-backend',type=Path,help='test-only packet ABI library; requires --sd-bridge')
 parser.add_argument('--screenshot',action='store_true',help='also write deterministic 1280x800 BMP24, not an actual capture')
 parser.add_argument('--devicecheck-registry',type=Path,help='root checkout for actual DeviceCheck discovery with mock metadata registry')
+parser.add_argument('--devicecheck-export',action='store_true',help='actual manual core/adapter export; requires registry')
 args=parser.parse_args()
+if args.devicecheck_export and not args.devicecheck_registry:parser.error('--devicecheck-export requires --devicecheck-registry')
 if args.msdc_backend and not args.sd_bridge:parser.error('--msdc-backend requires --sd-bridge')
 here=Path(__file__).resolve().parent;root=here.parents[1]
 for cmd in ('clang','mformat','mcopy'):
@@ -40,6 +42,7 @@ with tempfile.TemporaryDirectory(prefix='fat-native-') as td:
         app=board/'Applications/DeviceCheck'
         extra+=['-DFAT_REGISTRY_FIXTURE','-I'+str(app),'-I'+str(board/'Tests/DeviceCheck')]
         extra+=[str(app/n) for n in ('SdFatTarget.c','SdFatExport.c','ManualExportCore.c')]
+        if args.devicecheck_export:extra+=['-DFAT_REGISTRY_EXPORT',str(app/'ManualExportChoice.c')]
     if args.screenshot:extra+=['-DFAT_SCREENSHOT_FIXTURE']
     if args.msdc_backend:extra+=['-DFAT_MSDC_BACKEND','-ldl']
     subprocess.run(['clang',*extra,'-fshort-wchar','-DMDEPKG_NDEBUG','-I'+str(here),
@@ -65,3 +68,12 @@ with tempfile.TemporaryDirectory(prefix='fat-native-') as td:
         actual=bmp.read_bytes()
         assert len(actual)==3072054 and actual==expected
         print('Independent fresh mcopy: BMP 3072054 bytes including final tail exactly matched after collision; log also intact')
+
+    if args.devicecheck_export:
+        manual=t/'manual.txt'
+        subprocess.run(['mcopy','-i',str(image),'::T70-ABCDEF01.txt',str(manual)],check=True)
+        assert manual.read_bytes()==b'manual export fixture\n'
+        for name in ('T70-ABCDEF00.txt','T70-ABCDEF02.txt'):
+            missing=subprocess.run(['mcopy','-i',str(image),'::'+name,str(t/name)],capture_output=True)
+            assert missing.returncode!=0 and not (t/name).exists()
+        print('Independent mcopy: confirmed adapter file intact after collision; cancelled/replayed and stale names absent')

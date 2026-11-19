@@ -130,6 +130,9 @@ int main(int argc,char **argv){
  assert(FatAllocateVolume((VOID *)1,&Disk,NULL,&Block)==0&&Installed);
 #ifdef FAT_REGISTRY_FIXTURE
  RegistryBefore(&Bs,&Block);
+#ifdef FAT_REGISTRY_EXPORT
+ RegistryExport(&Bs);
+#endif
 #endif
  EFI_FILE_PROTOCOL *Root=NULL,*File=NULL;assert(Fs->OpenVolume(Fs,&Root)==0&&Root);
  int InitialWrites=Writes;
