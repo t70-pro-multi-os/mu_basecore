@@ -19,6 +19,7 @@ parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--sd-bridge',action='store_true',help='route actual FAT I/O through actual SdDxe and a file-backed PassThru model')
 parser.add_argument('--msdc-backend',type=Path,help='test-only packet ABI library; requires --sd-bridge')
 parser.add_argument('--screenshot',action='store_true',help='also write deterministic 1280x800 BMP24, not an actual capture')
+parser.add_argument('--devicecheck-registry',type=Path,help='root checkout for actual DeviceCheck discovery with mock metadata registry')
 args=parser.parse_args()
 if args.msdc_backend and not args.sd_bridge:parser.error('--msdc-backend requires --sd-bridge')
 here=Path(__file__).resolve().parent;root=here.parents[1]
@@ -34,6 +35,11 @@ with tempfile.TemporaryDirectory(prefix='fat-native-') as td:
         sd=root/'MdeModulePkg/Bus/Sd/SdDxe'
         extra=['-include',str(here/'TestSdBuild.h'),'-DFAT_SD_BRIDGE','-ffunction-sections','-fdata-sections','-Wl,--gc-sections',
                '-I'+str(root/'MdeModulePkg/Include'),str(sd/'SdBlockIo.c'),str(sd/'SdDxe.c')]
+    if args.devicecheck_registry:
+        board=args.devicecheck_registry.resolve()/'Platforms/Teclast/t70proPkg'
+        app=board/'Applications/DeviceCheck'
+        extra+=['-DFAT_REGISTRY_FIXTURE','-I'+str(app),'-I'+str(board/'Tests/DeviceCheck')]
+        extra+=[str(app/n) for n in ('SdFatTarget.c','SdFatExport.c','ManualExportCore.c')]
     if args.screenshot:extra+=['-DFAT_SCREENSHOT_FIXTURE']
     if args.msdc_backend:extra+=['-DFAT_MSDC_BACKEND','-ldl']
     subprocess.run(['clang',*extra,'-fshort-wchar','-DMDEPKG_NDEBUG','-I'+str(here),

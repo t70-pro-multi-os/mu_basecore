@@ -16,7 +16,7 @@ EFI_GUID gEfiFileInfoGuid=EFI_FILE_INFO_ID;
 EFI_GUID gEfiFileSystemInfoGuid=EFI_FILE_SYSTEM_INFO_ID;
 EFI_GUID gEfiFileSystemVolumeLabelInfoIdGuid=EFI_FILE_SYSTEM_VOLUME_LABEL_ID;
 EFI_GUID gEfiEventBeforeExitBootServicesGuid={0};
-static int Fd,Flushes,Writes,Installed,Allocations;
+static int Fd,Flushes,Writes,Reads,Installed,Allocations;
 static UINT64 Length;
 static EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *Fs;
 static EFI_FAT_CREATE_NEW_PROTOCOL *New;
@@ -57,7 +57,7 @@ BOOLEAN FatStrToFat(CHAR16 *S,UINTN N,CHAR8 *F){for(UINTN I=0;I<N;I++){assert(S[
 #ifdef FAT_SD_BRIDGE
 #include "TestSdImageBridge.h"
 #endif
-static EFI_STATUS EFIAPI DiskRead(EFI_DISK_IO_PROTOCOL *D,UINT32 M,UINT64 O,UINTN N,VOID *B){(void)D;assert(M==7&&O<=Length&&N<=Length-O);
+static EFI_STATUS EFIAPI DiskRead(EFI_DISK_IO_PROTOCOL *D,UINT32 M,UINT64 O,UINTN N,VOID *B){(void)D;Reads++;assert(M==7&&O<=Length&&N<=Length-O);
 #ifdef FAT_SD_BRIDGE
  return BridgeIo(FALSE,M,O,N,B);
 #else
@@ -94,6 +94,9 @@ static EFI_STATUS EFIAPI Event(UINT32 T,EFI_TPL P,EFI_EVENT_NOTIFY N,CONST VOID 
 static EFI_STATUS EFIAPI CloseEvent(EFI_EVENT E){assert(E==(VOID *)2);return 0;}
 static EFI_STATUS EFIAPI Time(EFI_TIME *T,EFI_TIME_CAPABILITIES *C){(void)C;memset(T,0,sizeof(*T));T->Year=2026;T->Month=11;T->Day=19;return 0;}
 static EFI_STATUS EFIAPI Crc(VOID *Data,UINTN N,UINT32 *Out){UINT32 V=~0U;UINT8 *B=Data;for(UINTN I=0;I<N;I++){V^=B[I];for(int J=0;J<8;J++)V=(V>>1)^(0xedb88320U&-(V&1));}*Out=~V;return 0;}
+#ifdef FAT_REGISTRY_FIXTURE
+#include "FatRegistryFixture.h"
+#endif
 #ifdef FAT_SCREENSHOT_FIXTURE
 static void Le32(UINT8 *P,UINT32 V){for(unsigned I=0;I<4;I++)P[I]=(UINT8)(V>>(8*I));}
 static void ScreenshotFixture(EFI_FILE_PROTOCOL *Root){
@@ -125,6 +128,9 @@ int main(int argc,char **argv){
  EFI_BLOCK_IO_MEDIA Media={0};Media.MediaId=7;Media.MediaPresent=1;Media.BlockSize=512;Media.LastBlock=Length/512-1;
  EFI_BLOCK_IO_PROTOCOL Block={0};Block.Media=&Media;Block.FlushBlocks=BlockFlush;
  assert(FatAllocateVolume((VOID *)1,&Disk,NULL,&Block)==0&&Installed);
+#ifdef FAT_REGISTRY_FIXTURE
+ RegistryBefore(&Bs,&Block);
+#endif
  EFI_FILE_PROTOCOL *Root=NULL,*File=NULL;assert(Fs->OpenVolume(Fs,&Root)==0&&Root);
  int InitialWrites=Writes;
  assert(New->CreateNew(New,(VOID *)1,8,Root,L"T70-12345678.txt",&File)==EFI_MEDIA_CHANGED&&!File&&Writes==InitialWrites);
@@ -142,6 +148,9 @@ int main(int argc,char **argv){
  assert(Root->Close(Root)==0);
  FAT_VOLUME *Volume=CR(Fs,FAT_VOLUME,VolumeInterface,FAT_VOLUME_SIGNATURE);
  assert(FatAbandonVolume(Volume)==0&&!Installed&&!Allocations);
+#ifdef FAT_REGISTRY_FIXTURE
+ RegistryAfter(&Bs);
+#endif
  #ifdef FAT_SD_BRIDGE
 #ifdef FAT_MSDC_BACKEND
  UINT64 BackendCounts[5];BackendStats(BackendCounts);
