@@ -89,19 +89,21 @@ SetTime (
   IN EFI_TIME  *Time
   )
 {
-  EFI_STATUS  Status;
-  BOOLEAN     TimeSettingsChanged;
+  EFI_STATUS                  Status;
+  BOOLEAN                     TimeSettingsChanged;
+  NON_VOLATILE_TIME_SETTINGS   NewTimeSettings;
 
   if ((Time == NULL) || !IsTimeValid (Time)) {
     return EFI_INVALID_PARAMETER;
   }
 
+  NewTimeSettings     = mTimeSettings;
   TimeSettingsChanged = FALSE;
   if ((mTimeSettings.TimeZone != Time->TimeZone) ||
       (mTimeSettings.Daylight != Time->Daylight))
   {
-    mTimeSettings.TimeZone = Time->TimeZone;
-    mTimeSettings.Daylight = Time->Daylight;
+    NewTimeSettings.TimeZone = Time->TimeZone;
+    NewTimeSettings.Daylight = Time->Daylight;
     TimeSettingsChanged    = TRUE;
   }
 
@@ -118,11 +120,14 @@ SetTime (
                EFI_VARIABLE_BOOTSERVICE_ACCESS |
                EFI_VARIABLE_RUNTIME_ACCESS,
                sizeof (mTimeSettings),
-               (VOID *)&mTimeSettings
+               (VOID *)&NewTimeSettings
                );
     if (EFI_ERROR (Status)) {
       return EFI_DEVICE_ERROR;
     }
+
+    // Publish metadata only after both the RTC and persistent update succeed.
+    mTimeSettings = NewTimeSettings;
   }
 
   return EFI_SUCCESS;
