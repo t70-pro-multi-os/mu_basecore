@@ -966,6 +966,11 @@ SdReadWriteInternal (
     return EFI_SUCCESS;
   }
 
+  // Reject wrapping caller ranges before allocating or submitting requests.
+  if (BufferSize > MAX_UINTN - (UINTN)Buffer) {
+    return EFI_INVALID_PARAMETER;
+  }
+
   BlockSize = Media->BlockSize;
   if ((BufferSize % BlockSize) != 0) {
     return EFI_BAD_BUFFER_SIZE;
