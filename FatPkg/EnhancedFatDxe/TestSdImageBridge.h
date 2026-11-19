@@ -4,6 +4,18 @@
 BOOLEAN EFIAPI DebugCodeEnabled(VOID){return FALSE;}
 UINTN EFIAPI DevicePathNodeLength(CONST VOID *Node){CONST EFI_DEVICE_PATH_PROTOCOL *P=Node;return P->Length[0]+((UINTN)P->Length[1]<<8);}
 UINT64 EFIAPI MultU64x32(UINT64 V,UINT32 M){return V*M;}
+#ifdef FAT_MSDC_BACKEND
+#include <dlfcn.h>
+static CONST char *BackendPath;
+static EFI_STATUS (*BackendPacket)(EFI_SD_MMC_PASS_THRU_COMMAND_PACKET *);
+static void (*BackendStats)(UINT64 *);
+static void LoadBackend(void){
+ VOID *L=dlopen(BackendPath,RTLD_NOW|RTLD_LOCAL);if(!L)fprintf(stderr,"%s\n",dlerror());assert(L);
+ int (*Init)(int)=dlsym(L,"T70MsdcImageInit");
+ BackendPacket=dlsym(L,"T70MsdcImagePacket");BackendStats=dlsym(L,"T70MsdcImageStats");
+ assert(Init&&BackendPacket&&BackendStats&&Init(Fd)==0);
+}
+#endif
 static SD_DEVICE Sd;
 static SD_DRIVER_PRIVATE_DATA SdPrivate;
 static EFI_SD_MMC_PASS_THRU_PROTOCOL SdPass;
@@ -19,6 +31,15 @@ static EFI_STATUS EFIAPI BuildPath(EFI_SD_MMC_PASS_THRU_PROTOCOL *P,UINT8 Slot,E
 }
 static EFI_STATUS EFIAPI Card(EFI_SD_MMC_PASS_THRU_PROTOCOL *P,UINT8 Slot,EFI_SD_MMC_PASS_THRU_COMMAND_PACKET *Packet,EFI_EVENT Event){
  assert(P==&SdPass&&Slot==0&&!Event&&Packet&&Packet->SdMmcCmdBlk&&Packet->SdMmcStatusBlk);
+#ifdef FAT_MSDC_BACKEND
+ UINT32 Cmd=Packet->SdMmcCmdBlk->CommandIndex;
+ assert(Cmd==13?CardPending:!CardPending);
+ EFI_STATUS S=BackendPacket(Packet);if(EFI_ERROR(S))return S;
+ if(Cmd==13){SdStatuses++;CardPending=FALSE;}
+ else if(Cmd==24||Cmd==25){SdWrites++;CardPending=TRUE;if(Cmd==24)SdCmd24++;else SdCmd25++;}
+ else {assert(Cmd==17||Cmd==18);SdReads++;}
+ return S;
+#else
  EFI_SD_MMC_COMMAND_BLOCK *C=Packet->SdMmcCmdBlk;memset(Packet->SdMmcStatusBlk,0,sizeof(*Packet->SdMmcStatusBlk));
  if(C->CommandIndex==13){
   assert(CardPending&&C->CommandArgument==(1U<<16));SdStatuses++;CardPending=FALSE;
@@ -34,6 +55,7 @@ static EFI_STATUS EFIAPI Card(EFI_SD_MMC_PASS_THRU_PROTOCOL *P,UINT8 Slot,EFI_SD
  if(Write){assert(pwrite(Fd,B,N,Offset)==(ssize_t)N);SdWrites++;if(C->CommandIndex==24)SdCmd24++;else SdCmd25++;CardPending=TRUE;}
  else {assert(pread(Fd,B,N,Offset)==(ssize_t)N);SdReads++;}
  Packet->TransactionStatus=0;return 0;
+#endif
 }
 // Byte requests are explicitly adapted with read-modify-write for partial sectors.
 static EFI_STATUS BridgeIo(BOOLEAN Write,UINT32 Mid,UINT64 Offset,UINTN Size,VOID *Buffer){
@@ -57,6 +79,9 @@ static EFI_STATUS BridgeFlush(void){
  if(!EFI_ERROR(S)&&fsync(Fd)!=0)return EFI_DEVICE_ERROR;return S;
 }
 static void InitBridge(EFI_BOOT_SERVICES *Bs){
+#ifdef FAT_MSDC_BACKEND
+ LoadBackend();
+#endif
  Bs->RaiseTPL=Raise;Bs->RestoreTPL=Restore;Bs->Stall=Stall;
  SdPass.PassThru=Card;SdPass.BuildDevicePath=BuildPath;SdPrivate.PassThru=&SdPass;
  Sd.Signature=SD_DEVICE_SIGNATURE;Sd.Private=&SdPrivate;Sd.SectorAddressing=TRUE;Sd.Rca=1;

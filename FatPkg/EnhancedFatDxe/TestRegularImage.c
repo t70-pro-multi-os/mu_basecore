@@ -95,7 +95,12 @@ static EFI_STATUS EFIAPI CloseEvent(EFI_EVENT E){assert(E==(VOID *)2);return 0;}
 static EFI_STATUS EFIAPI Time(EFI_TIME *T,EFI_TIME_CAPABILITIES *C){(void)C;memset(T,0,sizeof(*T));T->Year=2026;T->Month=11;T->Day=19;return 0;}
 static EFI_STATUS EFIAPI Crc(VOID *Data,UINTN N,UINT32 *Out){UINT32 V=~0U;UINT8 *B=Data;for(UINTN I=0;I<N;I++){V^=B[I];for(int J=0;J<8;J++)V=(V>>1)^(0xedb88320U&-(V&1));}*Out=~V;return 0;}
 int main(int argc,char **argv){
- assert(argc==2);Fd=atoi(argv[1]);struct stat St;assert(fstat(Fd,&St)==0&&S_ISREG(St.st_mode)&&St.st_nlink==1&&St.st_size==32*1024*1024);Length=St.st_size;
+#ifdef FAT_MSDC_BACKEND
+ assert(argc==3);BackendPath=argv[2];
+#else
+ assert(argc==2);
+#endif
+ Fd=atoi(argv[1]);struct stat St;assert(fstat(Fd,&St)==0&&S_ISREG(St.st_mode)&&St.st_nlink==1&&St.st_size==32*1024*1024);Length=St.st_size;
  EFI_BOOT_SERVICES Bs={0};Bs.InstallMultipleProtocolInterfaces=Install;Bs.UninstallMultipleProtocolInterfaces=Remove;Bs.CreateEventEx=Event;Bs.CloseEvent=CloseEvent;Bs.CalculateCrc32=Crc;gBS=&Bs;
  #ifdef FAT_SD_BRIDGE
  InitBridge(&Bs);
@@ -120,6 +125,11 @@ int main(int argc,char **argv){
  FAT_VOLUME *Volume=CR(Fs,FAT_VOLUME,VolumeInterface,FAT_VOLUME_SIGNATURE);
  assert(FatAbandonVolume(Volume)==0&&!Installed&&!Allocations);
  #ifdef FAT_SD_BRIDGE
+#ifdef FAT_MSDC_BACKEND
+ UINT64 BackendCounts[5];BackendStats(BackendCounts);
+ assert(BackendCounts[0]==SdWrites+SdReads+SdStatuses&&BackendCounts[1]>0&&BackendCounts[2]>0&&BackendCounts[3]==SdStatuses&&BackendCounts[4]==SdCmd25);
+ printf("Actual MSDC FIFO: RX=%llu TX=%llu bytes, CMD13=%llu CMD25=%llu\n",(unsigned long long)BackendCounts[1],(unsigned long long)BackendCounts[2],(unsigned long long)BackendCounts[3],(unsigned long long)BackendCounts[4]);
+#endif
  assert(SdWrites>0&&SdReads>0&&SdStatuses==SdWrites&&SdFlushes==Flushes&&!CardPending&&Tpl==TPL_APPLICATION);
  printf("Actual SdDxe: %u read packets, CMD24=%u CMD25=%u, %u ordered CMD13, %u FlushBlocks calls\n",SdReads,SdCmd24,SdCmd25,SdStatuses,SdFlushes);
 #endif

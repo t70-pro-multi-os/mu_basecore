@@ -17,7 +17,9 @@ from pathlib import Path
 import os,shutil,subprocess,tempfile,argparse
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--sd-bridge',action='store_true',help='route actual FAT I/O through actual SdDxe and a file-backed PassThru model')
+parser.add_argument('--msdc-backend',type=Path,help='test-only packet ABI library; requires --sd-bridge')
 args=parser.parse_args()
+if args.msdc_backend and not args.sd_bridge:parser.error('--msdc-backend requires --sd-bridge')
 here=Path(__file__).resolve().parent;root=here.parents[1]
 for cmd in ('clang','mformat','mcopy'):
     if not shutil.which(cmd):raise SystemExit('Missing existing dependency: '+cmd)
@@ -31,11 +33,12 @@ with tempfile.TemporaryDirectory(prefix='fat-native-') as td:
         sd=root/'MdeModulePkg/Bus/Sd/SdDxe'
         extra=['-include',str(here/'TestSdBuild.h'),'-DFAT_SD_BRIDGE','-ffunction-sections','-fdata-sections','-Wl,--gc-sections',
                '-I'+str(root/'MdeModulePkg/Include'),str(sd/'SdBlockIo.c'),str(sd/'SdDxe.c')]
+    if args.msdc_backend:extra+=['-DFAT_MSDC_BACKEND','-ldl']
     subprocess.run(['clang',*extra,'-fshort-wchar','-DMDEPKG_NDEBUG','-I'+str(here),
       '-I'+str(root/'MdePkg/Include'),'-I'+str(root/'MdePkg/Include/AArch64'),'-I'+str(root/'FatPkg/Include'),
       *[str(here/(n+'.c')) for n in names],str(here/'TestRegularImage.c'),'-o',str(out)],check=True)
     with image.open('r+b') as f:
-        subprocess.run([str(out),str(f.fileno())],pass_fds=(f.fileno(),),check=True)
+        subprocess.run([str(out),str(f.fileno())]+([str(args.msdc_backend.resolve())] if args.msdc_backend else []),pass_fds=(f.fileno(),),check=True)
     restored=t/'readback.bin'
     subprocess.run(['mcopy','-i',str(image),'::T70-12345678.txt',str(restored)],check=True)
     expected=bytes((i*37+11)&255 for i in range(8193))
