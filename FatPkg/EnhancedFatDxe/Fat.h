@@ -35,6 +35,8 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
 //
 // The FAT signature
 //
+#include <Protocol/FatCreateNew.h>
+
 #define FAT_VOLUME_SIGNATURE   SIGNATURE_32 ('f', 'a', 't', 'v')
 #define FAT_IFILE_SIGNATURE    SIGNATURE_32 ('f', 'a', 't', 'i')
 #define FAT_ODIR_SIGNATURE     SIGNATURE_32 ('f', 'a', 't', 'd')
@@ -317,6 +319,7 @@ struct _FAT_VOLUME {
   BOOLEAN                            DiskError;
 
   EFI_SIMPLE_FILE_SYSTEM_PROTOCOL    VolumeInterface;
+  EFI_FAT_CREATE_NEW_PROTOCOL        CreateNewInterface;
 
   //
   // If opened, the parent handle and BlockIo interface
@@ -2072,3 +2075,5 @@ FatOnBeforeExitBootServices (
   IN EFI_EVENT  Event,
   IN VOID       *Context
   );
+
+EFI_STATUS EFIAPI FatCreateNewDiagnostic (EFI_FAT_CREATE_NEW_PROTOCOL *This, EFI_HANDLE VolumeHandle, UINT32 MediaId, EFI_FILE_PROTOCOL *Root, CONST CHAR16 *Name, EFI_FILE_PROTOCOL **NewFile);

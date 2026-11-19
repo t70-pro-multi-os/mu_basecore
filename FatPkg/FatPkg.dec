@@ -17,3 +17,9 @@
 
 [UserExtensions.TianoCore."ExtraFiles"]
   FatPkgExtra.uni
+
+[Includes]
+  Include
+
+[Protocols]
+  gEfiFatCreateNewProtocolGuid = {0x4720e0ed,0x40f5,0x4c44,{0xa9,0x50,0x29,0xd1,0x70,0x44,0x37,0xfa}}

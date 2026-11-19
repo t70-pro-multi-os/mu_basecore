@@ -54,6 +54,8 @@ FatAllocateVolume (
   Volume->ReadOnly                   = BlockIo->Media->ReadOnly;
   Volume->VolumeInterface.Revision   = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_REVISION;
   Volume->VolumeInterface.OpenVolume = FatOpenVolume;
+  Volume->CreateNewInterface.Revision = 1;
+  Volume->CreateNewInterface.CreateNew = FatCreateNewDiagnostic;
   InitializeListHead (&Volume->CheckRef);
   InitializeListHead (&Volume->DirCacheList);
   //
@@ -110,6 +112,8 @@ FatAllocateVolume (
                   &Volume->Handle,
                   &gEfiSimpleFileSystemProtocolGuid,
                   &Volume->VolumeInterface,
+                  &gEfiFatCreateNewProtocolGuid,
+                  &Volume->CreateNewInterface,
                   NULL
                   );
   if (EFI_ERROR (Status)) {
@@ -180,6 +184,8 @@ FatAbandonVolume (
                     Volume->Handle,
                     &gEfiSimpleFileSystemProtocolGuid,
                     &Volume->VolumeInterface,
+                    &gEfiFatCreateNewProtocolGuid,
+                    &Volume->CreateNewInterface,
                     NULL
                     );
     if (EFI_ERROR (Status)) {
