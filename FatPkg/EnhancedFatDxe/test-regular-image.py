@@ -14,10 +14,11 @@ is left TRUE and the isolated synthetic media is writable for this test.
 No command-line path is accepted. No downloads, device nodes, or RO changes.
 """
 from pathlib import Path
-import os,shutil,subprocess,tempfile,argparse
+import os,shutil,subprocess,tempfile,argparse,struct
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--sd-bridge',action='store_true',help='route actual FAT I/O through actual SdDxe and a file-backed PassThru model')
 parser.add_argument('--msdc-backend',type=Path,help='test-only packet ABI library; requires --sd-bridge')
+parser.add_argument('--screenshot',action='store_true',help='also write deterministic 1280x800 BMP24, not an actual capture')
 args=parser.parse_args()
 if args.msdc_backend and not args.sd_bridge:parser.error('--msdc-backend requires --sd-bridge')
 here=Path(__file__).resolve().parent;root=here.parents[1]
@@ -33,6 +34,7 @@ with tempfile.TemporaryDirectory(prefix='fat-native-') as td:
         sd=root/'MdeModulePkg/Bus/Sd/SdDxe'
         extra=['-include',str(here/'TestSdBuild.h'),'-DFAT_SD_BRIDGE','-ffunction-sections','-fdata-sections','-Wl,--gc-sections',
                '-I'+str(root/'MdeModulePkg/Include'),str(sd/'SdBlockIo.c'),str(sd/'SdDxe.c')]
+    if args.screenshot:extra+=['-DFAT_SCREENSHOT_FIXTURE']
     if args.msdc_backend:extra+=['-DFAT_MSDC_BACKEND','-ldl']
     subprocess.run(['clang',*extra,'-fshort-wchar','-DMDEPKG_NDEBUG','-I'+str(here),
       '-I'+str(root/'MdePkg/Include'),'-I'+str(root/'MdePkg/Include/AArch64'),'-I'+str(root/'FatPkg/Include'),
@@ -44,3 +46,16 @@ with tempfile.TemporaryDirectory(prefix='fat-native-') as td:
     expected=bytes((i*37+11)&255 for i in range(8193))
     assert restored.read_bytes()==expected
     print('Independent fresh mcopy: 8193 bytes matched after FAT unmount')
+
+    if args.screenshot:
+        bmp=t/'readback.bmp'
+        subprocess.run(['mcopy','-i',str(image),'::T70-12345678.bmp',str(bmp)],check=True)
+        expected=bytearray(54)
+        expected[0:2]=b'BM'
+        for offset,value in ((2,3072054),(10,54),(14,40),(18,1280),(22,800),(34,3072000)):
+            struct.pack_into('<I',expected,offset,value)
+        struct.pack_into('<H',expected,26,1);struct.pack_into('<H',expected,28,24)
+        expected+=bytes((i*13+i//3840*17)&255 for i in range(3072000))
+        actual=bmp.read_bytes()
+        assert len(actual)==3072054 and actual==expected
+        print('Independent fresh mcopy: BMP 3072054 bytes including final tail exactly matched after collision; log also intact')

@@ -94,6 +94,21 @@ static EFI_STATUS EFIAPI Event(UINT32 T,EFI_TPL P,EFI_EVENT_NOTIFY N,CONST VOID 
 static EFI_STATUS EFIAPI CloseEvent(EFI_EVENT E){assert(E==(VOID *)2);return 0;}
 static EFI_STATUS EFIAPI Time(EFI_TIME *T,EFI_TIME_CAPABILITIES *C){(void)C;memset(T,0,sizeof(*T));T->Year=2026;T->Month=11;T->Day=19;return 0;}
 static EFI_STATUS EFIAPI Crc(VOID *Data,UINTN N,UINT32 *Out){UINT32 V=~0U;UINT8 *B=Data;for(UINTN I=0;I<N;I++){V^=B[I];for(int J=0;J<8;J++)V=(V>>1)^(0xedb88320U&-(V&1));}*Out=~V;return 0;}
+#ifdef FAT_SCREENSHOT_FIXTURE
+static void Le32(UINT8 *P,UINT32 V){for(unsigned I=0;I<4;I++)P[I]=(UINT8)(V>>(8*I));}
+static void ScreenshotFixture(EFI_FILE_PROTOCOL *Root){
+ // Deterministic BMP24, NOT an actual GOP capture. Positive height = bottom-up.
+ const UINTN Size=54+1280*800*3;UINT8 *Bmp=calloc(1,Size);assert(Bmp);
+ Bmp[0]='B';Bmp[1]='M';Le32(Bmp+2,Size);Le32(Bmp+10,54);Le32(Bmp+14,40);
+ Le32(Bmp+18,1280);Le32(Bmp+22,800);Bmp[26]=1;Bmp[28]=24;Le32(Bmp+34,Size-54);
+ for(UINTN I=54;I<Size;I++)Bmp[I]=(UINT8)((I-54)*13+(I-54)/3840*17);
+ EFI_FILE_PROTOCOL *File=NULL;assert(New->CreateNew(New,(VOID *)1,7,Root,L"T70-12345678.bmp",&File)==0&&File);
+ UINTN N=Size;assert(File->Write(File,&N,Bmp)==0&&N==Size);
+ int Before=Flushes;assert(File->Flush(File)==0&&Flushes>Before);assert(File->Close(File)==0);
+ File=(VOID *)99;assert(New->CreateNew(New,(VOID *)1,7,Root,L"T70-12345678.bmp",&File)==EFI_ACCESS_DENIED&&File==NULL);
+ free(Bmp);printf("BMP fixture: 3072054 bytes in one File.Write, Flush/Close and collision rejection passed\n");
+}
+#endif
 int main(int argc,char **argv){
 #ifdef FAT_MSDC_BACKEND
  assert(argc==3);BackendPath=argv[2];
@@ -121,6 +136,9 @@ int main(int argc,char **argv){
  UINTN N=sizeof(Payload);assert(File->Write(File,&N,Payload)==0&&N==sizeof(Payload));
  int Before=Flushes;assert(File->Flush(File)==0&&Flushes>Before);assert(File->Close(File)==0);
  File=(VOID *)99;assert(New->CreateNew(New,(VOID *)1,7,Root,L"T70-12345678.txt",&File)==EFI_ACCESS_DENIED&&File==NULL);
+ #ifdef FAT_SCREENSHOT_FIXTURE
+ ScreenshotFixture(Root);
+#endif
  assert(Root->Close(Root)==0);
  FAT_VOLUME *Volume=CR(Fs,FAT_VOLUME,VolumeInterface,FAT_VOLUME_SIGNATURE);
  assert(FatAbandonVolume(Volume)==0&&!Installed&&!Allocations);
