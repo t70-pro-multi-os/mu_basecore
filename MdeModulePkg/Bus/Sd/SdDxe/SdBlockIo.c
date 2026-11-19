@@ -1274,6 +1274,10 @@ SdQueueOrderedIo (
                     Io,
                     &Io->Transfer.Event
                     );
+    if (EFI_ERROR (Status)) {
+      // A failed CreateEvent does not transfer ownership of its output.
+      Io->Transfer.Event = NULL;
+    }
   }
 
   if (!EFI_ERROR (Status)) {
