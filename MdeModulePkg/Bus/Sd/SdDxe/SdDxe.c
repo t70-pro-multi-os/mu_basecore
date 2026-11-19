@@ -32,6 +32,7 @@ SD_DEVICE  mSdDeviceTemplate = {
   NULL,                        // Handle
   NULL,                        // DevicePath
   0xFF,                        // Slot
+  0,                           // Rca
   FALSE,                       // SectorAddressing
   {                            // BlockIo
     EFI_BLOCK_IO_PROTOCOL_REVISION,
@@ -78,6 +79,13 @@ SD_DEVICE  mSdDeviceTemplate = {
     NULL,
     NULL
   },
+  {                            // OrderedIo
+    NULL,
+    NULL
+  },
+  NULL,                        // OrderedIoTimer
+  FALSE,                       // WriteInProgress
+  FALSE,                       // WriteStatusPending
   {                            // Csd
     0,
   },
@@ -344,11 +352,12 @@ DiscoverUserArea (
     return Status;
   }
 
-  Status = SdSendStatus (Device, Rca, &DevStatus);
+  Status = SdSendStatus (Device, Rca, SD_GENERIC_TIMEOUT, &DevStatus);
   if (EFI_ERROR (Status)) {
     return Status;
   }
 
+  Device->Rca                         = Rca;
   Device->SectorAddressing            = SectorAddressing;
   Device->BlockIo.Media               = &Device->BlockMedia;
   Device->BlockIo2.Media              = &Device->BlockMedia;
@@ -481,7 +490,8 @@ SdClaimChildStop (
 
   OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
   if ((Device->ActiveOperations != 0) || Device->ResetInProgress ||
-      Device->StopInProgress || !IsListEmpty (&Device->Queue))
+      Device->StopInProgress || !IsListEmpty (&Device->Queue) ||
+      !IsListEmpty (&Device->OrderedIo))
   {
     gBS->RestoreTPL (OldTpl);
     return FALSE;
@@ -646,6 +656,7 @@ DiscoverSdDevice (
   Device->Slot       = Slot;
   Device->Private    = Private;
   InitializeListHead (&Device->Queue);
+  InitializeListHead (&Device->OrderedIo);
 
   //
   // Expose user area in the Sd memory card to upper layer.

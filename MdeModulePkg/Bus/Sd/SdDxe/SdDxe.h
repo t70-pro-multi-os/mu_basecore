@@ -104,6 +104,7 @@ struct _SD_DEVICE {
   EFI_HANDLE                  Handle;
   EFI_DEVICE_PATH_PROTOCOL    *DevicePath;
   UINT8                       Slot;
+  UINT16                      Rca;
   BOOLEAN                     SectorAddressing;
   EFI_BLOCK_IO_PROTOCOL       BlockIo;
   EFI_BLOCK_IO2_PROTOCOL      BlockIo2;
@@ -115,6 +116,10 @@ struct _SD_DEVICE {
   EFI_DISK_INFO_PROTOCOL      DiskInfo;
 
   LIST_ENTRY                  Queue;
+  LIST_ENTRY                  OrderedIo;
+  EFI_EVENT                   OrderedIoTimer;
+  BOOLEAN                     WriteInProgress;
+  BOOLEAN                     WriteStatusPending;
 
   SD_CSD                      Csd;
   SD_CID                      Cid;
@@ -473,7 +478,8 @@ EFI_STATUS
 SdSendStatus (
   IN     SD_DEVICE  *Device,
   IN     UINT16     Rca,
-  OUT UINT32        *DevStatus
+  IN     UINT64     Timeout,
+  OUT    UINT32     *DevStatus
   );
 
 /**

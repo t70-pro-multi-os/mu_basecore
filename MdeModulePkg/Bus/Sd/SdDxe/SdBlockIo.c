@@ -8,6 +8,37 @@
 
 #include "SdDxe.h"
 
+#define SD_MAX_BLOCKS_PER_COMMAND     0xFFFFU
+#define SD_WRITE_STATUS_POLLS       100
+#define SD_WRITE_STATUS_INTERVAL_US  10000
+#define SD_WRITE_STATUS_TIMEOUT_US   10000
+#define SD_ORDERED_IO_PERIOD_100NS   10000
+
+#define SD_R1_READY_FOR_DATA          BIT8
+#define SD_R1_STATE_MASK              (0xFU << 9)
+#define SD_R1_STATE_TRAN              (4U << 9)
+#define SD_R1_WRITE_PROTECT           (BIT26 | BIT25)
+#define SD_R1_ERRORS                  (BIT31 | BIT30 | BIT29 | BIT28 | BIT27 | BIT24 | BIT23 | \
+                                       BIT22 | BIT21 | BIT20 | BIT19 | BIT16)
+
+typedef enum {
+  SdOrderedRead,
+  SdOrderedWrite,
+  SdOrderedFlush
+} SD_ORDERED_OPERATION;
+
+typedef struct {
+  LIST_ENTRY            Link;
+  SD_ORDERED_OPERATION  Operation;
+  EFI_BLOCK_IO2_TOKEN   *Token;
+  EFI_LBA               Lba;
+  VOID                  *Buffer;
+  UINTN                 BytesRemaining;
+  UINTN                 WriteSize;
+  BOOLEAN               TransferPending;
+  SD_REQUEST            Transfer;
+} SD_ORDERED_IO;
+
 /**
   Check the media ID and latched state as one TPL-protected observation.
 **/
@@ -240,7 +271,7 @@ SdBeginReset (
   if (Device->MediaInvalidated || !Device->BlockMedia.MediaPresent) {
     Status = EFI_NO_MEDIA;
   } else if (Device->ResetInProgress || (Device->ActiveOperations > 1) ||
-             !IsListEmpty (&Device->Queue)) {
+             !IsListEmpty (&Device->Queue) || !IsListEmpty (&Device->OrderedIo)) {
     Status = EFI_NOT_READY;
   } else {
     Device->ResetInProgress = TRUE;
@@ -460,6 +491,7 @@ SdSelect (
 
   @param[in]  Device            A pointer to the SD_DEVICE instance.
   @param[in]  Rca               The relative device address to use.
+  @param[in]  Timeout           The command timeout in microseconds.
   @param[out] DevStatus         The buffer to store the device status.
 
   @retval EFI_SUCCESS           The request is executed successfully.
@@ -471,7 +503,8 @@ EFI_STATUS
 SdSendStatus (
   IN     SD_DEVICE  *Device,
   IN     UINT16     Rca,
-  OUT UINT32        *DevStatus
+  IN     UINT64     Timeout,
+  OUT    UINT32     *DevStatus
   )
 {
   EFI_STATUS                           Status;
@@ -487,7 +520,7 @@ SdSendStatus (
   ZeroMem (&Packet, sizeof (Packet));
   Packet.SdMmcCmdBlk    = &SdMmcCmdBlk;
   Packet.SdMmcStatusBlk = &SdMmcStatusBlk;
-  Packet.Timeout        = SD_GENERIC_TIMEOUT;
+  Packet.Timeout       = Timeout;
 
   SdMmcCmdBlk.CommandIndex    = SD_SEND_STATUS;
   SdMmcCmdBlk.CommandType     = SdMmcCommandTypeAc;
@@ -500,6 +533,127 @@ SdSendStatus (
   }
 
   return Status;
+}
+
+static EFI_STATUS
+SdWriteResponseStatus (
+  IN UINT32  Response
+  )
+{
+  if ((Response & SD_R1_WRITE_PROTECT) != 0) {
+    return EFI_WRITE_PROTECTED;
+  }
+
+  return ((Response & SD_R1_ERRORS) != 0) ? EFI_DEVICE_ERROR : EFI_SUCCESS;
+}
+
+/**
+  Confirm programming after CMD24/CMD25. The caller owns the card I/O order
+  throughout this function and runs at TPL_CALLBACK or below.
+**/
+static EFI_STATUS
+SdConfirmWrite (
+  IN SD_DEVICE  *Device,
+  IN UINT32     WriteResponse
+  )
+{
+  EFI_STATUS  Status;
+  EFI_STATUS  WriteStatus;
+  UINT32      Response;
+  UINTN       Attempt;
+
+  WriteStatus = SdWriteResponseStatus (WriteResponse);
+  for (Attempt = 0; Attempt < SD_WRITE_STATUS_POLLS; Attempt++) {
+    Status = SdCheckMediaReady (Device, FALSE);
+    if (EFI_ERROR (Status)) {
+      return Status;
+    }
+
+    Status = SdSendStatus (Device, Device->Rca, SD_WRITE_STATUS_TIMEOUT_US, &Response);
+    if (EFI_ERROR (Status)) {
+      return Status;
+    }
+
+    Status = SdCheckMediaReady (Device, FALSE);
+    if (EFI_ERROR (Status)) {
+      return Status;
+    }
+
+    // Some R1 error bits clear when read. Keep an error seen while still busy.
+    if (!EFI_ERROR (WriteStatus)) {
+      WriteStatus = SdWriteResponseStatus (Response);
+    }
+
+    if ((Response & (SD_R1_READY_FOR_DATA | SD_R1_STATE_MASK)) ==
+        (SD_R1_READY_FOR_DATA | SD_R1_STATE_TRAN))
+    {
+      Device->WriteStatusPending = FALSE;
+      return WriteStatus;
+    }
+
+    if (Attempt + 1 < SD_WRITE_STATUS_POLLS) {
+      gBS->Stall (SD_WRITE_STATUS_INTERVAL_US);
+    }
+  }
+
+  return EFI_ERROR (WriteStatus) ? WriteStatus : EFI_TIMEOUT;
+}
+
+/**
+  Admit direct I/O in the absence of an ordered request. A synchronous writer
+  or a caller rechecking a timed-out write needs exclusive use of the card.
+  Release Exclusive even if the status recheck fails.
+**/
+static EFI_STATUS
+SdBeginImmediateIo (
+  IN  SD_DEVICE  *Device,
+  IN  BOOLEAN    IsWrite,
+  IN  BOOLEAN    IsAsync,
+  OUT BOOLEAN    *Exclusive
+  )
+{
+  EFI_TPL     OldTpl;
+  EFI_STATUS  Status;
+
+  *Exclusive = FALSE;
+  Status     = EFI_SUCCESS;
+  OldTpl     = gBS->RaiseTPL (TPL_NOTIFY);
+  if (Device->MediaInvalidated || !Device->BlockMedia.MediaPresent) {
+    Status = EFI_NO_MEDIA;
+  } else if (Device->WriteInProgress || !IsListEmpty (&Device->OrderedIo)) {
+    Status = EFI_NOT_READY;
+  } else if (IsWrite || Device->WriteStatusPending) {
+    if (IsAsync || (Device->ActiveOperations != 1) || !IsListEmpty (&Device->Queue)) {
+      Status = EFI_NOT_READY;
+    } else {
+      Device->WriteInProgress = TRUE;
+      *Exclusive              = TRUE;
+    }
+  }
+
+  gBS->RestoreTPL (OldTpl);
+  if (*Exclusive && Device->WriteStatusPending) {
+    Status = SdConfirmWrite (Device, 0);
+    SdInvalidateMediaOnStatus (Device, Status);
+    Status = SdNormalizeMediaStatus (Status);
+  }
+
+  return Status;
+}
+
+static VOID
+SdEndImmediateIo (
+  IN SD_DEVICE  *Device,
+  IN BOOLEAN    Exclusive
+  )
+{
+  EFI_TPL  OldTpl;
+
+  if (Exclusive) {
+    OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+    Device->WriteInProgress = FALSE;
+    gBS->RestoreTPL (OldTpl);
+  }
 }
 
 /**
@@ -608,334 +762,201 @@ SdGetCid (
   return Status;
 }
 
-/**
-  Read/write single block through sync or async I/O request.
-
-  @param[in]  Device            A pointer to the SD_DEVICE instance.
-  @param[in]  Lba               The starting logical block address to be read/written.
-                                The caller is responsible for reading/writing to only
-                                legitimate locations.
-  @param[in]  Buffer            A pointer to the destination/source buffer for the data.
-  @param[in]  BufferSize        Size of Buffer, must be a multiple of device block size.
-  @param[in]  IsRead            Indicates it is a read or write operation.
-  @param[in]  Token             A pointer to the token associated with the transaction.
-  @param[in]  IsEnd             A boolean to show whether it's the last cmd in a series of cmds.
-                                This parameter is only meaningful in async I/O request.
-
-  @retval EFI_SUCCESS           The request is executed successfully.
-  @retval EFI_OUT_OF_RESOURCES  The request could not be executed due to a lack of resources.
-  @retval Others                The request could not be executed successfully.
-
-**/
-EFI_STATUS
-SdRwSingleBlock (
-  IN  SD_DEVICE            *Device,
-  IN  EFI_LBA              Lba,
-  IN  VOID                 *Buffer,
-  IN  UINTN                BufferSize,
-  IN  BOOLEAN              IsRead,
-  IN  EFI_BLOCK_IO2_TOKEN  *Token,
-  IN  BOOLEAN              IsEnd,
-  IN  SD_IO_BATCH          *Batch
+static VOID
+SdInitRwPacket (
+  IN SD_DEVICE   *Device,
+  IN SD_REQUEST  *Request,
+  IN EFI_LBA     Lba,
+  IN VOID        *Buffer,
+  IN UINTN       BufferSize,
+  IN BOOLEAN     IsRead
   )
 {
-  EFI_STATUS                     Status;
-  EFI_SD_MMC_PASS_THRU_PROTOCOL  *PassThru;
-  SD_REQUEST                     *RwSingleBlkReq;
-  BOOLEAN                         IsAsync;
+  BOOLEAN  SingleBlock;
 
-  RwSingleBlkReq = NULL;
-  IsAsync = (BOOLEAN)((Token != NULL) && (Token->Event != NULL));
-  PassThru       = Device->Private->PassThru;
-
-  RwSingleBlkReq = AllocateZeroPool (sizeof (SD_REQUEST));
-  if (RwSingleBlkReq == NULL) {
-    Status = EFI_OUT_OF_RESOURCES;
-    goto Error;
-  }
-
-  RwSingleBlkReq->Signature = SD_REQUEST_SIGNATURE;
-  Status = SdEnqueueRequest (Device, RwSingleBlkReq);
-  if (EFI_ERROR (Status)) {
-    goto Error;
-  }
-  RwSingleBlkReq->Packet.SdMmcCmdBlk    = &RwSingleBlkReq->SdMmcCmdBlk;
-  RwSingleBlkReq->Packet.SdMmcStatusBlk = &RwSingleBlkReq->SdMmcStatusBlk;
-  //
-  // Calculate timeout value through the below formula.
-  // Timeout = (transfer size) / (2MB/s).
-  // Taking 2MB/s as divisor as it's the lowest transfer speed
-  // above class 2.
-  // Refer to SD Physical Layer Simplified spec section 3.4 for details.
-  //
-  RwSingleBlkReq->Packet.Timeout = (BufferSize / (2 * 1024 * 1024) + 1) * 1000 * 1000;
+  SingleBlock = (BOOLEAN)(BufferSize == Device->BlockMedia.BlockSize);
+  ZeroMem (&Request->Packet, sizeof (Request->Packet));
+  ZeroMem (&Request->SdMmcCmdBlk, sizeof (Request->SdMmcCmdBlk));
+  ZeroMem (&Request->SdMmcStatusBlk, sizeof (Request->SdMmcStatusBlk));
+  // Use 2 MiB/s, the lower bound for a Speed Class 2 card, plus one second.
+  Request->Packet.SdMmcCmdBlk        = &Request->SdMmcCmdBlk;
+  Request->Packet.SdMmcStatusBlk     = &Request->SdMmcStatusBlk;
+  Request->Packet.Timeout           = (BufferSize / (2 * 1024 * 1024) + 1) * 1000 * 1000;
+  Request->Packet.TransactionStatus = EFI_NOT_READY;
+  Request->SdMmcCmdBlk.CommandType   = SdMmcCommandTypeAdtc;
+  Request->SdMmcCmdBlk.ResponseType  = SdMmcResponseTypeR1;
 
   if (IsRead) {
-    RwSingleBlkReq->Packet.InDataBuffer     = Buffer;
-    RwSingleBlkReq->Packet.InTransferLength = (UINT32)BufferSize;
-
-    RwSingleBlkReq->SdMmcCmdBlk.CommandIndex = SD_READ_SINGLE_BLOCK;
-    RwSingleBlkReq->SdMmcCmdBlk.CommandType  = SdMmcCommandTypeAdtc;
-    RwSingleBlkReq->SdMmcCmdBlk.ResponseType = SdMmcResponseTypeR1;
+    Request->Packet.InDataBuffer     = Buffer;
+    Request->Packet.InTransferLength  = (UINT32)BufferSize;
+    Request->SdMmcCmdBlk.CommandIndex  = SingleBlock ? SD_READ_SINGLE_BLOCK : SD_READ_MULTIPLE_BLOCK;
   } else {
-    RwSingleBlkReq->Packet.OutDataBuffer     = Buffer;
-    RwSingleBlkReq->Packet.OutTransferLength = (UINT32)BufferSize;
-
-    RwSingleBlkReq->SdMmcCmdBlk.CommandIndex = SD_WRITE_SINGLE_BLOCK;
-    RwSingleBlkReq->SdMmcCmdBlk.CommandType  = SdMmcCommandTypeAdtc;
-    RwSingleBlkReq->SdMmcCmdBlk.ResponseType = SdMmcResponseTypeR1;
+    Request->Packet.OutDataBuffer     = Buffer;
+    Request->Packet.OutTransferLength = (UINT32)BufferSize;
+    Request->SdMmcCmdBlk.CommandIndex  = SingleBlock ? SD_WRITE_SINGLE_BLOCK : SD_WRITE_MULTIPLE_BLOCK;
   }
 
   if (Device->SectorAddressing) {
-    RwSingleBlkReq->SdMmcCmdBlk.CommandArgument = (UINT32)Lba;
+    Request->SdMmcCmdBlk.CommandArgument = (UINT32)Lba;
   } else {
-    RwSingleBlkReq->SdMmcCmdBlk.CommandArgument = (UINT32)MultU64x32 (Lba, Device->BlockMedia.BlockSize);
+    Request->SdMmcCmdBlk.CommandArgument = (UINT32)MultU64x32 (Lba, Device->BlockMedia.BlockSize);
   }
-
-  RwSingleBlkReq->IsEnd = IsEnd;
-  RwSingleBlkReq->Token = Token;
-
-  if (IsAsync) {
-    Status = gBS->CreateEvent (
-                    EVT_NOTIFY_SIGNAL,
-                    TPL_NOTIFY,
-                    AsyncIoCallback,
-                    RwSingleBlkReq,
-                    &RwSingleBlkReq->Event
-                    );
-    if (EFI_ERROR (Status)) {
-      goto Error;
-    }
-  } else {
-    RwSingleBlkReq->Event = NULL;
-  }
-
-  SdAttachBatch (RwSingleBlkReq, Batch);
-  Status = PassThru->PassThru (PassThru, Device->Slot, &RwSingleBlkReq->Packet, RwSingleBlkReq->Event);
-
-Error:
-  if (IsAsync) {
-    //
-    // For asynchronous operation, only free request and event in error case.
-    // The request and event will be freed in asynchronous callback for success case.
-    //
-    if (EFI_ERROR (Status) && (RwSingleBlkReq != NULL)) {
-      SdDequeueRequest (Device, RwSingleBlkReq);
-      if (RwSingleBlkReq->Event != NULL) {
-        gBS->CloseEvent (RwSingleBlkReq->Event);
-      }
-
-      if (RwSingleBlkReq->Batch != NULL) {
-        EFI_TPL OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
-        SdReleaseBatchAtNotify (RwSingleBlkReq->Batch, SdNormalizeMediaStatus (Status));
-        gBS->RestoreTPL (OldTpl);
-      }
-      FreePool (RwSingleBlkReq);
-    }
-  } else {
-    //
-    // For synchronous operation, free request whatever the execution result is.
-    //
-    if (RwSingleBlkReq != NULL) {
-      SdDequeueRequest (Device, RwSingleBlkReq);
-      FreePool (RwSingleBlkReq);
-    }
-  }
-
-  return Status;
 }
 
-/**
-  Read/write multiple blocks through sync or async I/O request.
-
-  @param[in]  Device            A pointer to the SD_DEVICE instance.
-  @param[in]  Lba               The starting logical block address to be read/written.
-                                The caller is responsible for reading/writing to only
-                                legitimate locations.
-  @param[in]  Buffer            A pointer to the destination/source buffer for the data.
-  @param[in]  BufferSize        Size of Buffer, must be a multiple of device block size.
-  @param[in]  IsRead            Indicates it is a read or write operation.
-  @param[in]  Token             A pointer to the token associated with the transaction.
-  @param[in]  IsEnd             A boolean to show whether it's the last cmd in a series of cmds.
-                                This parameter is only meaningful in async I/O request.
-
-  @retval EFI_SUCCESS           The request is executed successfully.
-  @retval EFI_OUT_OF_RESOURCES  The request could not be executed due to a lack of resources.
-  @retval Others                The request could not be executed successfully.
-
-**/
-EFI_STATUS
-SdRwMultiBlocks (
-  IN  SD_DEVICE            *Device,
-  IN  EFI_LBA              Lba,
-  IN  VOID                 *Buffer,
-  IN  UINTN                BufferSize,
-  IN  BOOLEAN              IsRead,
-  IN  EFI_BLOCK_IO2_TOKEN  *Token,
-  IN  BOOLEAN              IsEnd,
-  IN  SD_IO_BATCH          *Batch
+static EFI_STATUS
+SdSubmitWrite (
+  IN SD_DEVICE   *Device,
+  IN SD_REQUEST  *Request
   )
 {
   EFI_STATUS                     Status;
-  SD_REQUEST                     *RwMultiBlkReq;
-  BOOLEAN                         IsAsync;
   EFI_SD_MMC_PASS_THRU_PROTOCOL  *PassThru;
 
-  RwMultiBlkReq = NULL;
-  IsAsync = (BOOLEAN)((Token != NULL) && (Token->Event != NULL));
+  Status = SdCheckMediaReady (Device, FALSE);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
 
+  // Even a transport error can leave a card programming. Recheck CMD13
+  // before sending more data unless this write reaches TRAN on its own.
+  Device->WriteStatusPending = TRUE;
   PassThru = Device->Private->PassThru;
-
-  RwMultiBlkReq = AllocateZeroPool (sizeof (SD_REQUEST));
-  if (RwMultiBlkReq == NULL) {
-    Status = EFI_OUT_OF_RESOURCES;
-    goto Error;
-  }
-
-  RwMultiBlkReq->Signature = SD_REQUEST_SIGNATURE;
-  Status = SdEnqueueRequest (Device, RwMultiBlkReq);
-  if (EFI_ERROR (Status)) {
-    goto Error;
-  }
-  RwMultiBlkReq->Packet.SdMmcCmdBlk    = &RwMultiBlkReq->SdMmcCmdBlk;
-  RwMultiBlkReq->Packet.SdMmcStatusBlk = &RwMultiBlkReq->SdMmcStatusBlk;
-  //
-  // Calculate timeout value through the below formula.
-  // Timeout = (transfer size) / (2MB/s).
-  // Taking 2MB/s as divisor as it's the lowest transfer speed
-  // above class 2.
-  // Refer to SD Physical Layer Simplified spec section 3.4 for details.
-  //
-  RwMultiBlkReq->Packet.Timeout = (BufferSize / (2 * 1024 * 1024) + 1) * 1000 * 1000;
-
-  if (IsRead) {
-    RwMultiBlkReq->Packet.InDataBuffer     = Buffer;
-    RwMultiBlkReq->Packet.InTransferLength = (UINT32)BufferSize;
-
-    RwMultiBlkReq->SdMmcCmdBlk.CommandIndex = SD_READ_MULTIPLE_BLOCK;
-    RwMultiBlkReq->SdMmcCmdBlk.CommandType  = SdMmcCommandTypeAdtc;
-    RwMultiBlkReq->SdMmcCmdBlk.ResponseType = SdMmcResponseTypeR1;
-  } else {
-    RwMultiBlkReq->Packet.OutDataBuffer     = Buffer;
-    RwMultiBlkReq->Packet.OutTransferLength = (UINT32)BufferSize;
-
-    RwMultiBlkReq->SdMmcCmdBlk.CommandIndex = SD_WRITE_MULTIPLE_BLOCK;
-    RwMultiBlkReq->SdMmcCmdBlk.CommandType  = SdMmcCommandTypeAdtc;
-    RwMultiBlkReq->SdMmcCmdBlk.ResponseType = SdMmcResponseTypeR1;
-  }
-
-  if (Device->SectorAddressing) {
-    RwMultiBlkReq->SdMmcCmdBlk.CommandArgument = (UINT32)Lba;
-  } else {
-    RwMultiBlkReq->SdMmcCmdBlk.CommandArgument = (UINT32)MultU64x32 (Lba, Device->BlockMedia.BlockSize);
-  }
-
-  RwMultiBlkReq->IsEnd = IsEnd;
-  RwMultiBlkReq->Token = Token;
-
-  if (IsAsync) {
-    Status = gBS->CreateEvent (
-                    EVT_NOTIFY_SIGNAL,
-                    TPL_NOTIFY,
-                    AsyncIoCallback,
-                    RwMultiBlkReq,
-                    &RwMultiBlkReq->Event
-                    );
-    if (EFI_ERROR (Status)) {
-      goto Error;
-    }
-  } else {
-    RwMultiBlkReq->Event = NULL;
-  }
-
-  SdAttachBatch (RwMultiBlkReq, Batch);
-  Status = PassThru->PassThru (PassThru, Device->Slot, &RwMultiBlkReq->Packet, RwMultiBlkReq->Event);
-
-Error:
-  if (IsAsync) {
-    //
-    // For asynchronous operation, only free request and event in error case.
-    // The request and event will be freed in asynchronous callback for success case.
-    //
-    if (EFI_ERROR (Status) && (RwMultiBlkReq != NULL)) {
-      SdDequeueRequest (Device, RwMultiBlkReq);
-      if (RwMultiBlkReq->Event != NULL) {
-        gBS->CloseEvent (RwMultiBlkReq->Event);
-      }
-
-      if (RwMultiBlkReq->Batch != NULL) {
-        EFI_TPL OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
-        SdReleaseBatchAtNotify (RwMultiBlkReq->Batch, SdNormalizeMediaStatus (Status));
-        gBS->RestoreTPL (OldTpl);
-      }
-      FreePool (RwMultiBlkReq);
-    }
-  } else {
-    //
-    // For synchronous operation, free request whatever the execution result is.
-    //
-    if (RwMultiBlkReq != NULL) {
-      SdDequeueRequest (Device, RwMultiBlkReq);
-      FreePool (RwMultiBlkReq);
-    }
-  }
-
-  return Status;
+  return PassThru->PassThru (PassThru, Device->Slot, &Request->Packet, Request->Event);
 }
 
 /**
-  This function transfers data from/to the sd memory card device.
+  Read/write blocks through sync or async I/O request.
 
-  @param[in]       Device       A pointer to the SD_DEVICE instance.
-  @param[in]       MediaId      The media ID that the read/write request is for.
-  @param[in]       Lba          The starting logical block address to be read/written.
+  @param[in]  Device            A pointer to the SD_DEVICE instance.
+  @param[in]  Lba               The starting logical block address to be read/written.
                                 The caller is responsible for reading/writing to only
                                 legitimate locations.
-  @param[in, out]  Buffer       A pointer to the destination/source buffer for the data.
-  @param[in]       BufferSize   Size of Buffer, must be a multiple of device block size.
-  @param[in]       IsRead       Indicates it is a read or write operation.
-  @param[in, out]  Token        A pointer to the token associated with the transaction.
+  @param[in]  Buffer            A pointer to the destination/source buffer for the data.
+  @param[in]  BufferSize        Size of Buffer, must be a multiple of device block size.
+  @param[in]  IsRead            Indicates it is a read or write operation.
+  @param[in]  Token             A pointer to the token associated with the transaction.
+  @param[in]  IsEnd             A boolean to show whether it's the last cmd in a series of cmds.
+                                This parameter is only meaningful in async I/O request.
 
-  @retval EFI_SUCCESS           The data was read/written correctly to the device.
-  @retval EFI_WRITE_PROTECTED   The device can not be read/written to.
-  @retval EFI_DEVICE_ERROR      The device reported an error while performing the read/write.
-  @retval EFI_NO_MEDIA          There is no media in the device.
-  @retval EFI_MEDIA_CHANGED     The MediaId does not match the current device.
-  @retval EFI_BAD_BUFFER_SIZE   The Buffer was not a multiple of the block size of the device.
-  @retval EFI_INVALID_PARAMETER The read/write request contains LBAs that are not valid,
-                                or the buffer is not on proper alignment.
+  @retval EFI_SUCCESS           The request is executed successfully.
+  @retval EFI_OUT_OF_RESOURCES  The request could not be executed due to a lack of resources.
+  @retval Others                The request could not be executed successfully.
 
 **/
 static EFI_STATUS
-SdReadWriteInternal (
-  IN     SD_DEVICE            *Device,
-  IN     UINT32               MediaId,
-  IN     EFI_LBA              Lba,
-  IN OUT VOID                 *Buffer,
-  IN     UINTN                BufferSize,
-  IN     BOOLEAN              IsRead,
-  IN OUT EFI_BLOCK_IO2_TOKEN  *Token
+SdRwBlocks (
+  IN  SD_DEVICE            *Device,
+  IN  EFI_LBA              Lba,
+  IN  VOID                 *Buffer,
+  IN  UINTN                BufferSize,
+  IN  BOOLEAN              IsRead,
+  IN  EFI_BLOCK_IO2_TOKEN  *Token,
+  IN  BOOLEAN              IsEnd,
+  IN  SD_IO_BATCH          *Batch
   )
 {
-  EFI_STATUS          Status;
+  EFI_STATUS                     Status;
+  SD_REQUEST                     *Request;
+  BOOLEAN                         IsAsync;
+  EFI_SD_MMC_PASS_THRU_PROTOCOL  *PassThru;
+
+  Request = NULL;
+  IsAsync  = (BOOLEAN)((Token != NULL) && (Token->Event != NULL));
+  PassThru = Device->Private->PassThru;
+
+  Request = AllocateZeroPool (sizeof (SD_REQUEST));
+  if (Request == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto Error;
+  }
+
+  Request->Signature = SD_REQUEST_SIGNATURE;
+  Status = SdEnqueueRequest (Device, Request);
+  if (EFI_ERROR (Status)) {
+    goto Error;
+  }
+
+  SdInitRwPacket (Device, Request, Lba, Buffer, BufferSize, IsRead);
+
+  Request->IsEnd = IsEnd;
+  Request->Token = Token;
+
+  if (IsAsync) {
+    Status = gBS->CreateEvent (
+                    EVT_NOTIFY_SIGNAL,
+                    TPL_NOTIFY,
+                    AsyncIoCallback,
+                    Request,
+                    &Request->Event
+                    );
+    if (EFI_ERROR (Status)) {
+      goto Error;
+    }
+  } else {
+    Request->Event = NULL;
+  }
+
+  SdAttachBatch (Request, Batch);
+  if (IsRead) {
+    Status = PassThru->PassThru (PassThru, Device->Slot, &Request->Packet, Request->Event);
+  } else {
+    ASSERT (!IsAsync);
+    Status = SdSubmitWrite (Device, Request);
+    if (!EFI_ERROR (Status)) {
+      Status = SdConfirmWrite (Device, Request->SdMmcStatusBlk.Resp0);
+    }
+  }
+
+Error:
+  if (IsAsync) {
+    //
+    // For asynchronous operation, only free request and event in error case.
+    // The request and event will be freed in asynchronous callback for success case.
+    //
+    if (EFI_ERROR (Status) && (Request != NULL)) {
+      SdDequeueRequest (Device, Request);
+      if (Request->Event != NULL) {
+        gBS->CloseEvent (Request->Event);
+      }
+
+      if (Request->Batch != NULL) {
+        EFI_TPL OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+        SdReleaseBatchAtNotify (Request->Batch, SdNormalizeMediaStatus (Status));
+        gBS->RestoreTPL (OldTpl);
+      }
+      FreePool (Request);
+    }
+  } else {
+    //
+    // For synchronous operation, free request whatever the execution result is.
+    //
+    if (Request != NULL) {
+      SdDequeueRequest (Device, Request);
+      FreePool (Request);
+    }
+  }
+
+  return Status;
+}
+
+static EFI_STATUS
+SdValidateReadWrite (
+  IN SD_DEVICE  *Device,
+  IN UINT32     MediaId,
+  IN EFI_LBA    Lba,
+  IN VOID       *Buffer,
+  IN UINTN      BufferSize,
+  IN BOOLEAN    IsRead,
+  IN BOOLEAN    IsAsync
+  )
+{
   EFI_BLOCK_IO_MEDIA  *Media;
+  EFI_STATUS          Status;
   UINTN               BlockSize;
   UINTN               BlockNum;
   UINTN               IoAlign;
-  UINTN               Remaining;
-  UINT32              MaxBlock;
-  BOOLEAN             LastRw;
-  EFI_EVENT           CallerEvent;
-  BOOLEAN             IsAsync;
-  SD_IO_BATCH         *Batch;
-  EFI_TPL             OldTpl;
 
-  Status = EFI_SUCCESS;
-  Media  = &Device->BlockMedia;
-  LastRw = FALSE;
-  CallerEvent = (Token == NULL) ? NULL : Token->Event;
-  IsAsync     = (BOOLEAN)(CallerEvent != NULL);
-
+  Media = &Device->BlockMedia;
   Status = SdValidateMediaId (Device, MediaId);
   if (EFI_ERROR (Status)) {
     return Status;
@@ -958,11 +979,6 @@ SdReadWriteInternal (
   }
 
   if (BufferSize == 0) {
-    if (IsAsync) {
-      Token->TransactionStatus = EFI_SUCCESS;
-      gBS->SignalEvent (CallerEvent);
-    }
-
     return EFI_SUCCESS;
   }
 
@@ -987,8 +1003,34 @@ SdReadWriteInternal (
     return EFI_INVALID_PARAMETER;
   }
 
+  return EFI_SUCCESS;
+}
+
+static EFI_STATUS
+SdTransferBlocks (
+  IN     SD_DEVICE            *Device,
+  IN     EFI_LBA              Lba,
+  IN OUT VOID                 *Buffer,
+  IN     UINTN                BufferSize,
+  IN     BOOLEAN              IsRead,
+  IN OUT EFI_BLOCK_IO2_TOKEN  *Token
+  )
+{
+  EFI_STATUS   Status;
+  UINTN        BlockSize;
+  UINTN        BlockNum;
+  UINTN        Remaining;
+  BOOLEAN      LastRw;
+  EFI_EVENT    CallerEvent;
+  SD_IO_BATCH  *Batch;
+  EFI_TPL      OldTpl;
+
+  Status      = EFI_SUCCESS;
+  BlockSize   = Device->BlockMedia.BlockSize;
+  LastRw      = FALSE;
+  CallerEvent = (Token == NULL) ? NULL : Token->Event;
   Batch = NULL;
-  if (IsAsync) {
+  if (CallerEvent != NULL) {
     Batch = AllocateZeroPool (sizeof (*Batch));
     if (Batch == NULL) { return EFI_OUT_OF_RESOURCES; }
     Batch->References = 1; // Submission owner survives immediate callbacks.
@@ -1000,23 +1042,18 @@ SdReadWriteInternal (
   //
   // Start to execute data transfer. The max block number in single cmd is 65535 blocks.
   //
-  Remaining = BlockNum;
-  MaxBlock  = 0xFFFF;
+  Remaining = BufferSize / BlockSize;
 
   while (Remaining > 0) {
-    if (Remaining <= MaxBlock) {
+    if (Remaining <= SD_MAX_BLOCKS_PER_COMMAND) {
       BlockNum = Remaining;
       LastRw   = TRUE;
     } else {
-      BlockNum = MaxBlock;
+      BlockNum = SD_MAX_BLOCKS_PER_COMMAND;
     }
 
     BufferSize = BlockNum * BlockSize;
-    if (BlockNum == 1) {
-      Status = SdRwSingleBlock (Device, Lba, Buffer, BufferSize, IsRead, Token, LastRw, Batch);
-    } else {
-      Status = SdRwMultiBlocks (Device, Lba, Buffer, BufferSize, IsRead, Token, LastRw, Batch);
-    }
+    Status = SdRwBlocks (Device, Lba, Buffer, BufferSize, IsRead, Token, LastRw, Batch);
 
     if (EFI_ERROR (Status)) {
       SdInvalidateMediaOnStatus (Device, Status);
@@ -1054,6 +1091,273 @@ SdReadWriteInternal (
     // Accepted commands retain caller memory until the single batch completion.
     if (Accepted) { return EFI_SUCCESS; }
   }
+  return Status;
+}
+
+/**
+  The provider owns Transfer until this notification runs at TPL_NOTIFY.
+  Publish its completion and latch removal here. The worker owns CMD13.
+**/
+static VOID
+EFIAPI
+SdWriteTransferComplete (
+  IN EFI_EVENT  Event,
+  IN VOID       *Context
+  )
+{
+  SD_ORDERED_IO  *Io;
+
+  Io = Context;
+  if (SdMediaUnavailableStatus (Io->Transfer.Packet.TransactionStatus)) {
+    SdInvalidateMediaAtNotify (Io->Transfer.Device);
+  }
+
+  Io->TransferPending = FALSE;
+}
+
+static EFI_STATUS
+SdAdvanceOrderedIo (
+  IN  SD_DEVICE      *Device,
+  IN  SD_ORDERED_IO  *Io,
+  OUT BOOLEAN        *Done
+  )
+{
+  EFI_STATUS  Status;
+
+  *Done = TRUE;
+  if (Io->WriteSize != 0) {
+    Status = Io->Transfer.Packet.TransactionStatus;
+    if (!EFI_ERROR (Status)) {
+      Status = SdConfirmWrite (Device, Io->Transfer.SdMmcStatusBlk.Resp0);
+    }
+
+    if (EFI_ERROR (Status)) {
+      return Status;
+    }
+
+    Io->Lba            += Io->WriteSize / Device->BlockMedia.BlockSize;
+    Io->Buffer          = (UINT8 *)Io->Buffer + Io->WriteSize;
+    Io->BytesRemaining -= Io->WriteSize;
+    Io->WriteSize       = 0;
+  }
+
+  Status = SdCheckMediaReady (Device, FALSE);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  if (Device->WriteStatusPending) {
+    Status = SdConfirmWrite (Device, 0);
+    if (EFI_ERROR (Status)) {
+      return Status;
+    }
+  }
+
+  if (Io->Operation == SdOrderedFlush) {
+    return SdCheckMediaReady (Device, TRUE);
+  }
+
+  if (Io->BytesRemaining == 0) {
+    return EFI_SUCCESS;
+  }
+
+  if (Io->Operation == SdOrderedRead) {
+    return SdTransferBlocks (Device, Io->Lba, Io->Buffer, Io->BytesRemaining, TRUE, NULL);
+  }
+
+  Io->WriteSize = MIN (Io->BytesRemaining, SD_MAX_BLOCKS_PER_COMMAND * Device->BlockMedia.BlockSize);
+  SdInitRwPacket (Device, &Io->Transfer, Io->Lba, Io->Buffer, Io->WriteSize, FALSE);
+  Io->TransferPending = TRUE;
+  Status = SdSubmitWrite (Device, &Io->Transfer);
+  *Done = (BOOLEAN)EFI_ERROR (Status);
+  return Status;
+}
+
+/**
+  Run the head request at TPL_CALLBACK. The list keeps the child and caller
+  buffers alive until both the provider and this worker have finished.
+**/
+static VOID
+EFIAPI
+SdProcessOrderedIo (
+  IN EFI_EVENT  Event,
+  IN VOID       *Context
+  )
+{
+  SD_DEVICE      *Device;
+  SD_ORDERED_IO  *Io;
+  EFI_TPL        OldTpl;
+  EFI_STATUS     Status;
+  BOOLEAN        Done;
+  EFI_EVENT      Completion;
+
+  Device = Context;
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  if ((Device->ActiveOperations != 0) || !IsListEmpty (&Device->Queue)) {
+    gBS->RestoreTPL (OldTpl);
+    return;
+  }
+
+  ASSERT (!IsListEmpty (&Device->OrderedIo));
+  Io = BASE_CR (GetFirstNode (&Device->OrderedIo), SD_ORDERED_IO, Link);
+  if (Io->TransferPending) {
+    gBS->RestoreTPL (OldTpl);
+    return;
+  }
+
+  gBS->RestoreTPL (OldTpl);
+  Status = SdAdvanceOrderedIo (Device, Io, &Done);
+  if (!Done) {
+    return;
+  }
+
+  OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+  if (SdMediaUnavailableStatus (Status)) {
+    SdInvalidateMediaAtNotify (Device);
+  }
+
+  if (!EFI_ERROR (Status) && Device->MediaInvalidated) {
+    Status = EFI_NO_MEDIA;
+  }
+
+  if (Io->Transfer.Event != NULL) {
+    gBS->CloseEvent (Io->Transfer.Event);
+  }
+
+  RemoveEntryList (&Io->Link);
+  if (IsListEmpty (&Device->OrderedIo)) {
+    Device->OrderedIoTimer = NULL;
+    gBS->CloseEvent (Event);
+  }
+
+  Completion = Io->Token->Event;
+  Io->Token->TransactionStatus = SdNormalizeMediaStatus (Status);
+  FreePool (Io);
+  gBS->RestoreTPL (OldTpl);
+
+  // The caller can release its token, buffer and child from this notification.
+  gBS->SignalEvent (Completion);
+}
+
+static EFI_STATUS
+SdQueueOrderedIo (
+  IN SD_DEVICE             *Device,
+  IN SD_ORDERED_OPERATION  Operation,
+  IN EFI_LBA               Lba,
+  IN VOID                  *Buffer,
+  IN UINTN                 BufferSize,
+  IN EFI_BLOCK_IO2_TOKEN   *Token
+  )
+{
+  SD_ORDERED_IO  *Io;
+  EFI_STATUS     Status;
+  EFI_TPL        OldTpl;
+  EFI_EVENT      Timer;
+
+  Io = AllocateZeroPool (sizeof (*Io));
+  if (Io == NULL) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  Io->Operation      = Operation;
+  Io->Lba            = Lba;
+  Io->Buffer         = Buffer;
+  Io->BytesRemaining = BufferSize;
+  Io->Token          = Token;
+  Io->Transfer.Device = Device;
+  Status             = EFI_SUCCESS;
+  if ((Operation == SdOrderedWrite) && (BufferSize != 0)) {
+    Status = gBS->CreateEvent (
+                    EVT_NOTIFY_SIGNAL,
+                    TPL_NOTIFY,
+                    SdWriteTransferComplete,
+                    Io,
+                    &Io->Transfer.Event
+                    );
+  }
+
+  if (!EFI_ERROR (Status)) {
+    OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+    if (Device->MediaInvalidated || !Device->BlockMedia.MediaPresent) {
+      Status = EFI_NO_MEDIA;
+    } else if (Device->OrderedIoTimer == NULL) {
+      Status = gBS->CreateEvent (
+                      EVT_TIMER | EVT_NOTIFY_SIGNAL,
+                      TPL_CALLBACK,
+                      SdProcessOrderedIo,
+                      Device,
+                      &Timer
+                      );
+      if (!EFI_ERROR (Status)) {
+        Status = gBS->SetTimer (Timer, TimerPeriodic, SD_ORDERED_IO_PERIOD_100NS);
+        if (EFI_ERROR (Status)) {
+          gBS->CloseEvent (Timer);
+        } else {
+          Device->OrderedIoTimer = Timer;
+        }
+      }
+    }
+
+    if (!EFI_ERROR (Status)) {
+      InsertTailList (&Device->OrderedIo, &Io->Link);
+    }
+
+    gBS->RestoreTPL (OldTpl);
+  }
+
+  if (EFI_ERROR (Status)) {
+    if (Io->Transfer.Event != NULL) {
+      gBS->CloseEvent (Io->Transfer.Event);
+    }
+
+    FreePool (Io);
+  }
+
+  return Status;
+}
+
+static EFI_STATUS
+SdReadWriteInternal (
+  IN     SD_DEVICE            *Device,
+  IN     UINT32               MediaId,
+  IN     EFI_LBA              Lba,
+  IN OUT VOID                 *Buffer,
+  IN     UINTN                BufferSize,
+  IN     BOOLEAN              IsRead,
+  IN OUT EFI_BLOCK_IO2_TOKEN  *Token
+  )
+{
+  EFI_STATUS  Status;
+  BOOLEAN     IsAsync;
+  BOOLEAN     Exclusive;
+  BOOLEAN     IsWrite;
+
+  IsAsync = (BOOLEAN)((Token != NULL) && (Token->Event != NULL));
+  IsWrite = (BOOLEAN)(!IsRead && (BufferSize != 0));
+  Status  = SdValidateReadWrite (Device, MediaId, Lba, Buffer, BufferSize, IsRead, IsAsync);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  if (IsAsync && IsWrite) {
+    return SdQueueOrderedIo (Device, SdOrderedWrite, Lba, Buffer, BufferSize, Token);
+  }
+
+  Status = SdBeginImmediateIo (Device, IsWrite, IsAsync, &Exclusive);
+  if ((Status == EFI_NOT_READY) && IsAsync) {
+    return SdQueueOrderedIo (Device, SdOrderedRead, Lba, Buffer, BufferSize, Token);
+  }
+
+  if (!EFI_ERROR (Status)) {
+    if (BufferSize != 0) {
+      Status = SdTransferBlocks (Device, Lba, Buffer, BufferSize, IsRead, Token);
+    } else if (IsAsync) {
+      Token->TransactionStatus = EFI_SUCCESS;
+      gBS->SignalEvent (Token->Event);
+    }
+  }
+
+  SdEndImmediateIo (Device, Exclusive);
   return Status;
 }
 
@@ -1231,6 +1535,44 @@ SdWriteBlocks (
   return Status;
 }
 
+static EFI_STATUS
+SdFlush (
+  IN     SD_DEVICE            *Device,
+  IN OUT EFI_BLOCK_IO2_TOKEN  *Token
+  )
+{
+  EFI_STATUS  Status;
+  BOOLEAN     IsAsync;
+  BOOLEAN     Exclusive;
+
+  IsAsync = (BOOLEAN)((Token != NULL) && (Token->Event != NULL));
+  Status  = SdBeginOperation (Device, FALSE, 0);
+  if (!EFI_ERROR (Status)) {
+    Status = SdBeginImmediateIo (Device, FALSE, IsAsync, &Exclusive);
+    if ((Status == EFI_NOT_READY) && IsAsync) {
+      Status = SdQueueOrderedIo (Device, SdOrderedFlush, 0, NULL, 0, Token);
+      SdEndOperation (Device);
+      return Status;
+    }
+
+    if (!EFI_ERROR (Status)) {
+      Status = SdCheckMediaReady (Device, (BOOLEAN)!IsAsync);
+    }
+
+    SdEndImmediateIo (Device, Exclusive);
+    SdEndOperation (Device);
+  }
+
+  if (Token != NULL) {
+    Token->TransactionStatus = Status;
+    if (IsAsync) {
+      gBS->SignalEvent (Token->Event);
+    }
+  }
+
+  return Status;
+}
+
 /**
   Flush the Block Device.
 
@@ -1244,21 +1586,10 @@ SdWriteBlocks (
 EFI_STATUS
 EFIAPI
 SdFlushBlocks (
-  IN  EFI_BLOCK_IO_PROTOCOL  *This
+  IN EFI_BLOCK_IO_PROTOCOL  *This
   )
 {
-  EFI_STATUS  Status;
-  SD_DEVICE   *Device;
-
-  Device = SD_DEVICE_DATA_FROM_BLKIO (This);
-  Status = SdBeginOperation (Device, FALSE, 0);
-  if (EFI_ERROR (Status)) {
-    return Status;
-  }
-
-  Status = SdCheckMediaReady (Device, TRUE);
-  SdEndOperation (Device);
-  return Status;
+  return SdFlush (SD_DEVICE_DATA_FROM_BLKIO (This), NULL);
 }
 
 /**
@@ -1292,7 +1623,8 @@ SdResetExInternal (
   OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
   if (Device->MediaInvalidated || !Device->BlockMedia.MediaPresent) {
     Status = EFI_NO_MEDIA;
-  } else if (Device->ResetInProgress || !IsListEmpty (&Device->Queue)) {
+  } else if (Device->ResetInProgress || Device->WriteInProgress ||
+             !IsListEmpty (&Device->Queue) || !IsListEmpty (&Device->OrderedIo)) {
     Status = EFI_NOT_READY;
   } else {
     Status = EFI_SUCCESS;
@@ -1320,7 +1652,8 @@ SdResetEx (
   OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
   if (Device->StopInProgress) {
     Status = ((Device->ActiveOperations == 0) && !Device->ResetInProgress &&
-              IsListEmpty (&Device->Queue)) ? EFI_SUCCESS : EFI_NOT_READY;
+              IsListEmpty (&Device->Queue) && IsListEmpty (&Device->OrderedIo)) ?
+             EFI_SUCCESS : EFI_NOT_READY;
     gBS->RestoreTPL (OldTpl);
     return Status;
   }
@@ -1442,32 +1775,7 @@ SdFlushBlocksEx (
   IN OUT EFI_BLOCK_IO2_TOKEN     *Token
   )
 {
-  EFI_STATUS  Status;
-  SD_DEVICE   *Device;
-
-  Device = SD_DEVICE_DATA_FROM_BLKIO2 (This);
-  Status = SdBeginOperation (Device, FALSE, 0);
-  if (EFI_ERROR (Status)) {
-    if (Token != NULL) {
-      Token->TransactionStatus = Status;
-      if (Token->Event != NULL) {
-        gBS->SignalEvent (Token->Event);
-      }
-    }
-
-    return Status;
-  }
-
-  Status = SdCheckMediaReady (Device, (BOOLEAN)((Token == NULL) || (Token->Event == NULL)));
-  if (Token != NULL) {
-    Token->TransactionStatus = Status;
-    if (Token->Event != NULL) {
-      gBS->SignalEvent (Token->Event);
-    }
-  }
-
-  SdEndOperation (Device);
-  return Status;
+  return SdFlush (SD_DEVICE_DATA_FROM_BLKIO2 (This), Token);
 }
 
 /**
@@ -1901,6 +2209,7 @@ SdEraseBlocks (
   SD_DEVICE   *Device;
   EFI_EVENT   CompletionEvent;
   BOOLEAN     Synchronous;
+  BOOLEAN     Exclusive;
 
   Device = SD_DEVICE_DATA_FROM_ERASEBLK (This);
   Status = SdBeginOperation (Device, TRUE, MediaId);
@@ -1910,7 +2219,13 @@ SdEraseBlocks (
 
   Synchronous = PcdGetBool (PcdSdDxeSynchronousPassThru);
   CompletionEvent = (Synchronous && (Token != NULL)) ? Token->Event : NULL;
-  Status = SdEraseBlocksInternal (This, MediaId, Lba, Synchronous ? NULL : Token, Size);
+  Status = SdBeginImmediateIo (Device, FALSE, (BOOLEAN)(!Synchronous && (Token != NULL) &&
+                                                       (Token->Event != NULL)), &Exclusive);
+  if (!EFI_ERROR (Status)) {
+    Status = SdEraseBlocksInternal (This, MediaId, Lba, Synchronous ? NULL : Token, Size);
+  }
+
+  SdEndImmediateIo (Device, Exclusive);
   SdEndOperation (Device);
   if ((CompletionEvent != NULL) && !EFI_ERROR (Status)) {
     Token->TransactionStatus = Status;
