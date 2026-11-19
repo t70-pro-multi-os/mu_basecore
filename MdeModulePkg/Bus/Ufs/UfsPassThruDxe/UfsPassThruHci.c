@@ -1871,14 +1871,16 @@ UfsValidateScsiResponse (
     Requested = 0;
   }
 
-  if ((Response->Flags & BIT5) != 0) {
+  // Linux 2903265e27bf: some devices omit UNDERFLOW with nonzero residual.
+  // Overflow was rejected above; validate the count before subtracting it.
+  Residual = Response->ResTranCount;
+  SwapLittleEndianToBigEndian ((UINT8 *)&Residual, sizeof (UINT32));
+  if (((Response->Flags & BIT5) != 0) || (Residual != 0)) {
     if (Requested == 0) {
       Packet->HostAdapterStatus = EFI_EXT_SCSI_STATUS_HOST_ADAPTER_PHASE_ERROR;
       return EFI_DEVICE_ERROR;
     }
 
-    Residual = Response->ResTranCount;
-    SwapLittleEndianToBigEndian ((UINT8 *)&Residual, sizeof (UINT32));
     if (Residual > Requested) {
       Packet->HostAdapterStatus = EFI_EXT_SCSI_STATUS_HOST_ADAPTER_PHASE_ERROR;
       return EFI_DEVICE_ERROR;
