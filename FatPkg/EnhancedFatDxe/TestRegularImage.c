@@ -54,9 +54,30 @@ VOID FatStrUpr(CHAR16 *S){for(;*S;S++){assert(*S<128);*S=toupper(*S);}}
 VOID FatStrLwr(CHAR16 *S){for(;*S;S++){assert(*S<128);*S=tolower(*S);}}
 VOID FatFatToStr(UINTN N,CHAR8 *F,CHAR16 *S){for(UINTN I=0;I<N;I++){assert((UINT8)F[I]<128);S[I]=(UINT8)F[I];}S[N]=0;}
 BOOLEAN FatStrToFat(CHAR16 *S,UINTN N,CHAR8 *F){for(UINTN I=0;I<N;I++){assert(S[I]<128);F[I]=(CHAR8)toupper(S[I]);}return FALSE;}
-static EFI_STATUS EFIAPI DiskRead(EFI_DISK_IO_PROTOCOL *D,UINT32 M,UINT64 O,UINTN N,VOID *B){(void)D;assert(M==7&&O<=Length&&N<=Length-O);return pread(Fd,B,N,O)==(ssize_t)N?0:EFI_DEVICE_ERROR;}
-static EFI_STATUS EFIAPI DiskWrite(EFI_DISK_IO_PROTOCOL *D,UINT32 M,UINT64 O,UINTN N,VOID *B){(void)D;assert(M==7&&O<=Length&&N<=Length-O);Writes++;return pwrite(Fd,B,N,O)==(ssize_t)N?0:EFI_DEVICE_ERROR;}
-static EFI_STATUS EFIAPI BlockFlush(EFI_BLOCK_IO_PROTOCOL *B){(void)B;Flushes++;return fsync(Fd)==0?0:EFI_DEVICE_ERROR;}
+#ifdef FAT_SD_BRIDGE
+#include "TestSdImageBridge.h"
+#endif
+static EFI_STATUS EFIAPI DiskRead(EFI_DISK_IO_PROTOCOL *D,UINT32 M,UINT64 O,UINTN N,VOID *B){(void)D;assert(M==7&&O<=Length&&N<=Length-O);
+#ifdef FAT_SD_BRIDGE
+ return BridgeIo(FALSE,M,O,N,B);
+#else
+ return pread(Fd,B,N,O)==(ssize_t)N?0:EFI_DEVICE_ERROR;
+#endif
+}
+static EFI_STATUS EFIAPI DiskWrite(EFI_DISK_IO_PROTOCOL *D,UINT32 M,UINT64 O,UINTN N,VOID *B){(void)D;assert(M==7&&O<=Length&&N<=Length-O);Writes++;
+#ifdef FAT_SD_BRIDGE
+ return BridgeIo(TRUE,M,O,N,B);
+#else
+ return pwrite(Fd,B,N,O)==(ssize_t)N?0:EFI_DEVICE_ERROR;
+#endif
+}
+static EFI_STATUS EFIAPI BlockFlush(EFI_BLOCK_IO_PROTOCOL *B){(void)B;Flushes++;
+#ifdef FAT_SD_BRIDGE
+ return BridgeFlush();
+#else
+ return fsync(Fd)==0?0:EFI_DEVICE_ERROR;
+#endif
+}
 static EFI_STATUS EFIAPI Install(EFI_HANDLE *H,...){
  assert(*H==(VOID *)1&&!Installed);va_list A;va_start(A,H);
  assert(va_arg(A,EFI_GUID *)==&gEfiSimpleFileSystemProtocolGuid);Fs=va_arg(A,VOID *);
@@ -76,6 +97,9 @@ static EFI_STATUS EFIAPI Crc(VOID *Data,UINTN N,UINT32 *Out){UINT32 V=~0U;UINT8 
 int main(int argc,char **argv){
  assert(argc==2);Fd=atoi(argv[1]);struct stat St;assert(fstat(Fd,&St)==0&&S_ISREG(St.st_mode)&&St.st_nlink==1&&St.st_size==32*1024*1024);Length=St.st_size;
  EFI_BOOT_SERVICES Bs={0};Bs.InstallMultipleProtocolInterfaces=Install;Bs.UninstallMultipleProtocolInterfaces=Remove;Bs.CreateEventEx=Event;Bs.CloseEvent=CloseEvent;Bs.CalculateCrc32=Crc;gBS=&Bs;
+ #ifdef FAT_SD_BRIDGE
+ InitBridge(&Bs);
+#endif
  EFI_RUNTIME_SERVICES Rt={0};Rt.GetTime=Time;gRT=&Rt;
  EFI_DISK_IO_PROTOCOL Disk={0};Disk.ReadDisk=DiskRead;Disk.WriteDisk=DiskWrite;
  EFI_BLOCK_IO_MEDIA Media={0};Media.MediaId=7;Media.MediaPresent=1;Media.BlockSize=512;Media.LastBlock=Length/512-1;
@@ -95,5 +119,9 @@ int main(int argc,char **argv){
  assert(Root->Close(Root)==0);
  FAT_VOLUME *Volume=CR(Fs,FAT_VOLUME,VolumeInterface,FAT_VOLUME_SIGNATURE);
  assert(FatAbandonVolume(Volume)==0&&!Installed&&!Allocations);
+ #ifdef FAT_SD_BRIDGE
+ assert(SdWrites>0&&SdReads>0&&SdStatuses==SdWrites&&SdFlushes==Flushes&&!CardPending&&Tpl==TPL_APPLICATION);
+ printf("Actual SdDxe: %u read packets, CMD24=%u CMD25=%u, %u ordered CMD13, %u FlushBlocks calls\n",SdReads,SdCmd24,SdCmd25,SdStatuses,SdFlushes);
+#endif
  assert(Writes>0&&Flushes>0);printf("Actual FAT create/write/flush/collision/unmount passed; %d disk writes, %d block flushes\n",Writes,Flushes);return 0;
 }
