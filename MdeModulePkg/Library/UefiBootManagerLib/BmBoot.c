@@ -10,6 +10,44 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
 
 #include "InternalBm.h"
 
+#ifdef T70PRO_RAM_DIAGNOSTICS
+#include <Protocol/T70UsbStorageDiagnostics.h>
+
+STATIC
+T70_USB_BOOT_READ_TRACE *
+BmTraceUsbBootReads (
+  IN EFI_LOADED_IMAGE_PROTOCOL  *Image
+  )
+{
+  STATIC EFI_GUID           TraceGuid = T70_USB_BOOT_READ_TRACE_GUID;
+  EFI_DEVICE_PATH_PROTOCOL  *Path;
+  EFI_HANDLE                UsbHandle;
+  EFI_BLOCK_IO_PROTOCOL     *Block;
+  T70_USB_BOOT_READ_TRACE   *Trace;
+  EFI_TPL                   OldTpl;
+  UINT32                    Attempt;
+
+  Path = DevicePathFromHandle (Image->DeviceHandle);
+  if ((Path == NULL) ||
+      EFI_ERROR (gBS->LocateDevicePath (&gEfiUsbIoProtocolGuid, &Path, &UsbHandle)) ||
+      EFI_ERROR (gBS->HandleProtocol (Image->DeviceHandle, &gEfiBlockIoProtocolGuid, (VOID **)&Block)) ||
+      !Block->Media->LogicalPartition ||
+      EFI_ERROR (gBS->LocateProtocol (&TraceGuid, NULL, (VOID **)&Trace)))
+  {
+    return NULL;
+  }
+
+  OldTpl  = gBS->RaiseTPL (TPL_NOTIFY);
+  Attempt = Trace->Attempt + 1;
+  ZeroMem (Trace, sizeof (*Trace));
+  Trace->PartitionBlockIo = Block;
+  Trace->Attempt          = Attempt;
+  Trace->Active           = TRUE;
+  gBS->RestoreTPL (OldTpl);
+  return Trace;
+}
+#endif
+
 EFI_RAM_DISK_PROTOCOL  *mRamDisk = NULL;
 
 EFI_BOOT_MANAGER_REFRESH_LEGACY_BOOT_OPTION  mBmRefreshLegacyBootOption = NULL;
@@ -1207,7 +1245,8 @@ BmExpandMediaDevicePath (
     //
     TempDevicePath = DevicePathFromHandle (SimpleFileSystemHandles[Index]);
     if (TempDevicePath == NULL) {
-      goto Exit;
+      // A pathless filesystem must not hide later bootable partitions.
+      continue;
     }
 
     TempSize = GetDevicePathSize (TempDevicePath) - END_DEVICE_PATH_LENGTH;
@@ -1228,7 +1267,6 @@ BmExpandMediaDevicePath (
     }
   }
 
-Exit:
   if (SimpleFileSystemHandles != NULL) {
     FreePool (SimpleFileSystemHandles);
   }
@@ -1960,6 +1998,9 @@ EfiBootManagerBoot (
   EFI_BOOT_LOGO_PROTOCOL     *BootLogo;
   EFI_EVENT                  LegacyBootEvent;
   UINTN                      ReportStatusCodeData[2];  // MU_CHANGE
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  T70_USB_BOOT_READ_TRACE    *UsbTrace;
+#endif
 
   if (BootOption == NULL) {
     return;
@@ -2204,7 +2245,15 @@ EfiBootManagerBoot (
 
   REPORT_STATUS_CODE (EFI_PROGRESS_CODE, PcdGet32 (PcdProgressCodeOsLoaderStart));
 
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  UsbTrace = BmTraceUsbBootReads (ImageInfo);
+#endif
   Status = gBS->StartImage (ImageHandle, &BootOption->ExitDataSize, &BootOption->ExitData);
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  if (UsbTrace != NULL) {
+    UsbTrace->Active = FALSE;
+  }
+#endif
   DEBUG ((DEBUG_INFO | DEBUG_LOAD, "Image Return Status = %r\n", Status));
   BootOption->Status = Status;
 

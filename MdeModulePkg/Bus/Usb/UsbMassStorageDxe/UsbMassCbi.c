@@ -329,7 +329,7 @@ UsbCbiDataTransfer (
       // Clear the stall if that is the case.
       //
       if (TransStatus == EFI_USB_ERR_STALL) {
-        UsbClearEndpointStall (UsbCbi->UsbIo, Endpoint->EndpointAddress);
+        UsbClearEndpointStall (UsbCbi->UsbIo, Endpoint->EndpointAddress, USB_BOOT_GENERAL_CMD_TIMEOUT / USB_MASS_1_MILLISECOND);
       }
 
       goto ON_EXIT;
@@ -579,8 +579,8 @@ UsbCbiResetDevice (
   //
   // Clear the Bulk-In and Bulk-Out stall condition and init data toggle.
   //
-  UsbClearEndpointStall (UsbCbi->UsbIo, UsbCbi->BulkInEndpoint->EndpointAddress);
-  UsbClearEndpointStall (UsbCbi->UsbIo, UsbCbi->BulkOutEndpoint->EndpointAddress);
+  UsbClearEndpointStall (UsbCbi->UsbIo, UsbCbi->BulkInEndpoint->EndpointAddress, USB_BOOT_GENERAL_CMD_TIMEOUT / USB_MASS_1_MILLISECOND);
+  UsbClearEndpointStall (UsbCbi->UsbIo, UsbCbi->BulkOutEndpoint->EndpointAddress, USB_BOOT_GENERAL_CMD_TIMEOUT / USB_MASS_1_MILLISECOND);
 
   return Status;
 }

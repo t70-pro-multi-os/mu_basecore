@@ -123,6 +123,8 @@ UsbBootRequestSense (
         Status = EFI_NOT_READY;
       } else if (SenseData.Asc == USB_BOOT_ASC_NO_MEDIA) {
         Status = EFI_NOT_READY;
+      } else if (SenseData.Asc == EFI_SCSI_ASC_RESET) {
+        Status = EFI_NOT_READY;
       }
 
       break;
@@ -214,6 +216,16 @@ UsbBootExecCmd (
     return EFI_SUCCESS;
   }
 
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  // A failed transport may have disconnected or left a BOT phase unfinished.
+  // A completed command with CHECK CONDITION still needs REQUEST SENSE.
+  if (EFI_ERROR (Status) && (Transport->Protocol == USB_MASS_STORE_BOT) &&
+      ((USB_BOT_PROTOCOL *)UsbMass->Context)->MediaProbe)
+  {
+    return Status;
+  }
+#endif
+
   //
   // If command execution failed, then retrieve error info via sense request.
   //
@@ -263,6 +275,23 @@ UsbBootExecCmdWithRetry (
   UINTN       Retry;
   EFI_EVENT   TimeoutEvt;
 
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  if ((UsbMass->Transport->Protocol == USB_MASS_STORE_BOT) &&
+      ((USB_BOT_PROTOCOL *)UsbMass->Context)->MediaProbe)
+  {
+    Status = UsbBootExecCmd (UsbMass, Cmd, CmdLen, DataDir, Data, DataLen, Timeout);
+    if ((Status == EFI_MEDIA_CHANGED) || (Status == EFI_NOT_READY)) {
+      // A fresh device normally clears UNIT ATTENTION or NOT READY after
+      // the first sense request. Retry once without holding TPL for a timer.
+      Status = UsbBootExecCmd (UsbMass, Cmd, CmdLen, DataDir, Data, DataLen, Timeout);
+      if ((Status == EFI_MEDIA_CHANGED) || (Status == EFI_NOT_READY)) {
+        Status = EFI_NOT_READY;
+      }
+    }
+    return Status;
+  }
+#endif
+
   Retry  = 0;
   Status = EFI_SUCCESS;
   Status = gBS->CreateEvent (
@@ -277,9 +306,7 @@ UsbBootExecCmdWithRetry (
   }
 
 #ifdef T70PRO_RAM_DIAGNOSTICS
-  // USB enumeration runs at the same TPL as keyboard callbacks. Do not
-  // hold that level for a minute while a medium keeps reporting NOT_READY.
-  // Leave a failed bind retryable through the on-demand diagnostic reconnect.
+  // Keep the existing T70 limit for synchronous I/O such as bootloader reads.
   Status = gBS->SetTimer (TimeoutEvt, TimerRelative, EFI_TIMER_PERIOD_SECONDS (2));
 #else
   Status = gBS->SetTimer (TimeoutEvt, TimerRelative, EFI_TIMER_PERIOD_SECONDS (60));
@@ -988,6 +1015,7 @@ UsbBootReadWriteBlocks16 (
 
   @param  UsbIo                  The USB I/O Protocol instance
   @param  EndpointAddr           The endpoint to clear stall for
+  @param  TimeoutMs              Time to wait for the control transfer
 
   @retval EFI_SUCCESS            The endpoint stall condition is cleared.
   @retval Others                 Failed to clear the endpoint stall condition.
@@ -996,26 +1024,25 @@ UsbBootReadWriteBlocks16 (
 EFI_STATUS
 UsbClearEndpointStall (
   IN EFI_USB_IO_PROTOCOL  *UsbIo,
-  IN UINT8                EndpointAddr
+  IN UINT8                EndpointAddr,
+  IN UINT32               TimeoutMs
   )
 {
   EFI_USB_DEVICE_REQUEST  Request;
   EFI_STATUS              Status;
   UINT32                  CmdResult;
-  UINT32                  Timeout;
 
   Request.RequestType = 0x02;
   Request.Request     = USB_REQ_CLEAR_FEATURE;
   Request.Value       = USB_FEATURE_ENDPOINT_HALT;
   Request.Index       = EndpointAddr;
   Request.Length      = 0;
-  Timeout             = USB_BOOT_GENERAL_CMD_TIMEOUT / USB_MASS_1_MILLISECOND;
 
   Status = UsbIo->UsbControlTransfer (
                     UsbIo,
                     &Request,
                     EfiUsbNoData,
-                    Timeout,
+                    TimeoutMs,
                     NULL,
                     0,
                     &CmdResult

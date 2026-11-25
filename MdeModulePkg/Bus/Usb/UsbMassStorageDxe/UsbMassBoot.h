@@ -330,5 +330,6 @@ UsbBootReadWriteBlocks16 (
 EFI_STATUS
 UsbClearEndpointStall (
   IN EFI_USB_IO_PROTOCOL  *UsbIo,
-  IN UINT8                EndpointAddr
+  IN UINT8                EndpointAddr,
+  IN UINT32               TimeoutMs
   );

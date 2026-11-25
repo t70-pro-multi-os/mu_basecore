@@ -267,7 +267,7 @@ UsbBotDataTransfer (
     if (USB_IS_ERROR (Result, EFI_USB_ERR_STALL)) {
       DEBUG ((DEBUG_INFO, "UsbBotDataTransfer: (%r)\n", Status));
       DEBUG ((DEBUG_INFO, "UsbBotDataTransfer: DataIn Stall\n"));
-      UsbClearEndpointStall (UsbBot->UsbIo, Endpoint->EndpointAddress);
+      UsbClearEndpointStall (UsbBot->UsbIo, Endpoint->EndpointAddress, USB_BOOT_GENERAL_CMD_TIMEOUT / USB_MASS_1_MILLISECOND);
     } else if (USB_IS_ERROR (Result, EFI_USB_ERR_NAK)) {
       Status = EFI_NOT_READY;
     } else {
@@ -344,7 +344,7 @@ UsbBotGetStatus (
     if (EFI_ERROR (Status)) {
       // BOT Figure 2 permits one CSW retry after clearing Bulk-In. A second
       // error, or a failed clear, requires reset recovery before another CBW.
-      if ((Index == 0) && !EFI_ERROR (UsbClearEndpointStall (UsbIo, Endpoint))) {
+      if ((Index == 0) && !EFI_ERROR (UsbClearEndpointStall (UsbIo, Endpoint, USB_BOOT_GENERAL_CMD_TIMEOUT / USB_MASS_1_MILLISECOND))) {
         continue;
       }
       UsbBotResetDevice (UsbBot, FALSE);
@@ -434,6 +434,10 @@ UsbBotExecCommand (
   //
   TransLen = (UINTN)DataLen;
   DataStatus = UsbBotDataTransfer (UsbBot, DataDir, Data, &TransLen, Timeout);
+  if (DataStatus == EFI_TIMEOUT) {
+    // The transport reset on timeout discarded this command and its CSW.
+    return DataStatus;
+  }
 
   //
   // Get the status, if that succeeds, interpret the result
@@ -525,8 +529,9 @@ UsbBotResetDevice (
   //
   // Clear the Bulk-In and Bulk-Out stall condition.
   //
-  Status    = UsbClearEndpointStall (UsbBot->UsbIo, UsbBot->BulkInEndpoint->EndpointAddress);
-  OutStatus = UsbClearEndpointStall (UsbBot->UsbIo, UsbBot->BulkOutEndpoint->EndpointAddress);
+  Timeout   = USB_BOOT_GENERAL_CMD_TIMEOUT / USB_MASS_1_MILLISECOND;
+  Status    = UsbClearEndpointStall (UsbBot->UsbIo, UsbBot->BulkInEndpoint->EndpointAddress, Timeout);
+  OutStatus = UsbClearEndpointStall (UsbBot->UsbIo, UsbBot->BulkOutEndpoint->EndpointAddress, Timeout);
 
   // Complete both clears in order, but never report a partial recovery as success.
   return EFI_ERROR (Status) ? Status : OutStatus;
@@ -571,6 +576,8 @@ UsbBotGetMaxLun (
   Request.Index       = UsbBot->Interface.InterfaceNumber;
   Request.Length      = 1;
   Timeout             = USB_BOT_RESET_DEVICE_TIMEOUT / USB_MASS_1_MILLISECOND;
+  Result              = 0;
+  *MaxLun             = 0;
 
   Status = UsbBot->UsbIo->UsbControlTransfer (
                             UsbBot->UsbIo,
@@ -581,16 +588,14 @@ UsbBotGetMaxLun (
                             1,
                             &Result
                             );
-  if (EFI_ERROR (Status) || (*MaxLun > USB_BOT_MAX_LUN)) {
-    //
-    // If the Get LUN request returns an error or the MaxLun is larger than
-    // the maximum LUN value (0x0f) supported by the USB Mass Storage Class
-    // Bulk-Only Transport Spec, then set MaxLun to 0.
-    //
-    // This improves compatibility with USB FLASH drives that have a single LUN
-    // and either do not return a max LUN value or return an invalid maximum LUN
-    // value.
-    //
+  if (EFI_ERROR (Status)) {
+    *MaxLun = 0;
+    // BOT 1.0 allows a single-LUN device to STALL this request.
+    return USB_IS_ERROR (Result, EFI_USB_ERR_STALL) ? EFI_SUCCESS : Status;
+  }
+
+  if (*MaxLun > USB_BOT_MAX_LUN) {
+    // Keep the single-LUN fallback for devices with an invalid reply.
     *MaxLun = 0;
   }
 

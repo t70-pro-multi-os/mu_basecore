@@ -518,8 +518,18 @@ UsbCtrlRequest (
   EFI_STATUS              Status;
   UINT32                  Result;
   UINTN                   Len;
+  UINTN                   Timeout;
 
   ASSERT ((UsbDev != NULL) && (UsbDev->Bus != NULL));
+
+  Timeout = USB_GENERAL_DEVICE_REQUEST_TIMEOUT;
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  // Prompt devices should not be queued behind a full control-transfer timeout.
+  // Allow the standard budget on the subsequent enumeration attempts.
+  if (UsbDev->Enumerating && (UsbDev->EnumScript == UsbEnumScriptWin)) {
+    Timeout = 100;
+  }
+#endif
 
   DevReq.RequestType = USB_REQUEST_TYPE (Direction, Type, Target);
   DevReq.Request     = (UINT8)Request;
@@ -537,7 +547,7 @@ UsbCtrlRequest (
              Direction,
              Buf,
              &Len,
-             USB_GENERAL_DEVICE_REQUEST_TIMEOUT,
+             Timeout,
              &UsbDev->Translator,
              &Result
              );
@@ -624,6 +634,11 @@ UsbGetMaxPacketSize0 (
       return EFI_SUCCESS;
     }
 
+#ifdef T70PRO_RAM_DIAGNOSTICS
+    if (UsbDev->Enumerating) {
+      return Status;
+    }
+#endif
     gBS->Stall (USB_RETRY_MAX_PACK_SIZE_STALL);
   }
 

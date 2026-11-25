@@ -8,6 +8,9 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
 **/
 
 #include "UsbBus.h"
+#ifdef T70PRO_RAM_DIAGNOSTICS
+#include <Protocol/T70UsbStorageDiagnostics.h>
+#endif
 
 /**
   Return the endpoint descriptor in this interface.
@@ -55,6 +58,13 @@ UsbFreeInterface (
   )
 {
   EFI_STATUS  Status;
+
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  if (UsbIf->StorageConnectEvent != NULL) {
+    gBS->CloseEvent (UsbIf->StorageConnectEvent);
+    UsbIf->StorageConnectEvent = NULL;
+  }
+#endif
 
   UsbCloseHostProtoByChild (UsbIf->Device->Bus, UsbIf->Handle);
 
@@ -242,13 +252,132 @@ UsbCreateDevice (
   return Device;
 }
 
+STATIC
+EFI_STATUS
+UsbStartInterfaceDriver (
+  IN USB_INTERFACE  *UsbIf
+  )
+{
+  EFI_STATUS  Status;
+  EFI_TPL     OldTpl;
+
+  // Driver binding can be triggered at either TPL_NOTIFY or TPL_CALLBACK.
+  OldTpl = UsbGetCurrentTpl ();
+  gBS->RestoreTPL (TPL_CALLBACK);
+  Status = gBS->ConnectController (UsbIf->Handle, NULL, NULL, TRUE);
+  UsbIf->IsManaged = (BOOLEAN)!EFI_ERROR (Status);
+  ASSERT (UsbGetCurrentTpl () == TPL_CALLBACK);
+  gBS->RaiseTPL (OldTpl);
+  return Status;
+}
+
+#ifdef T70PRO_RAM_DIAGNOSTICS
+#define USB_STORAGE_CONNECT_ATTEMPTS  20
+#define USB_STORAGE_RETRY_MS          200
+
+STATIC
+EFI_STATUS
+UsbStartStorageDriver (
+  IN USB_INTERFACE  *UsbIf
+  )
+{
+  STATIC EFI_GUID              DiagGuid = T70_USB_STORAGE_DIAGNOSTICS_GUID;
+  T70_USB_STORAGE_DIAGNOSTICS  *Diagnostics;
+  T70_USB_STORAGE_RECORD       *Record;
+  UINT32                       Sequence;
+  EFI_STATUS                   Status;
+
+  Status = gBS->LocateProtocol (&DiagGuid, NULL, (VOID **)&Diagnostics);
+  if (EFI_ERROR (Status) || (Diagnostics->Version != T70_USB_DIAG_VERSION)) {
+    return UsbStartInterfaceDriver (UsbIf);
+  }
+
+  Sequence = Diagnostics->Sequence;
+  Status   = UsbStartInterfaceDriver (UsbIf);
+  if ((Status == EFI_NOT_FOUND) && (Diagnostics->Sequence != Sequence)) {
+    // DXE returns NOT_FOUND when no driver starts, losing the Start() status.
+    for (UINTN Index = 0; Index < Diagnostics->Count; Index++) {
+      Record = &Diagnostics->Records[Index];
+      if ((Record->Controller == UsbIf->Handle) && (Record->Stage == 5) &&
+          ((UINT32)(Record->Sequence - Sequence) != 0) &&
+          ((UINT32)(Record->Sequence - Sequence) <= (UINT32)(Diagnostics->Sequence - Sequence)))
+      {
+        return Record->BindStatus;
+      }
+    }
+  }
+
+  return Status;
+}
+
+STATIC
+VOID
+EFIAPI
+UsbRetryStorageConnect (
+  IN EFI_EVENT  Event,
+  IN VOID       *Context
+  )
+{
+  USB_INTERFACE  *UsbIf;
+  EFI_STATUS     Status;
+
+  UsbIf = Context;
+  if (UsbIf->Device->Connected && !UsbIf->IsManaged) {
+    UsbIf->StorageConnectAttempts++;
+    Status = UsbStartStorageDriver (UsbIf);
+    if (((Status == EFI_NOT_READY) || (Status == EFI_TIMEOUT)) &&
+        (UsbIf->StorageConnectAttempts < USB_STORAGE_CONNECT_ATTEMPTS) &&
+        !EFI_ERROR (gBS->SetTimer (Event, TimerRelative, EFI_TIMER_PERIOD_MILLISECONDS (USB_STORAGE_RETRY_MS))))
+    {
+      return;
+    }
+  }
+
+  UsbIf->StorageConnectEvent = NULL;
+  gBS->CloseEvent (Event);
+}
+
+STATIC
+EFI_STATUS
+UsbQueueStorageConnect (
+  IN USB_INTERFACE  *UsbIf
+  )
+{
+  EFI_STATUS  Status;
+
+  if (UsbIf->IsManaged || (UsbIf->StorageConnectEvent != NULL)) {
+    return EFI_SUCCESS;
+  }
+
+  Status = gBS->CreateEvent (
+                  EVT_TIMER | EVT_NOTIFY_SIGNAL,
+                  TPL_CALLBACK,
+                  UsbRetryStorageConnect,
+                  UsbIf,
+                  &UsbIf->StorageConnectEvent
+                  );
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  UsbIf->StorageConnectAttempts = 0;
+  Status = gBS->SetTimer (UsbIf->StorageConnectEvent, TimerRelative, EFI_TIMER_PERIOD_MILLISECONDS (10));
+  if (EFI_ERROR (Status)) {
+    gBS->CloseEvent (UsbIf->StorageConnectEvent);
+    UsbIf->StorageConnectEvent = NULL;
+  }
+
+  return Status;
+}
+#endif
+
 /**
   Connect the USB interface with its driver. EFI USB bus will
   create a USB interface for each separate interface descriptor.
 
   @param  UsbIf             The interface to connect driver to.
 
-  @return EFI_SUCCESS       Interface is managed by some driver.
+  @return EFI_SUCCESS       The interface is managed or queued for connection.
   @return Others            Failed to locate a driver for this interface.
 
 **/
@@ -257,47 +386,24 @@ UsbConnectDriver (
   IN USB_INTERFACE  *UsbIf
   )
 {
-  EFI_STATUS  Status;
-  EFI_TPL     OldTpl;
-
-  Status = EFI_SUCCESS;
-
-  //
-  // Hub is maintained by the USB bus driver. Otherwise try to
-  // connect drivers with this interface
-  //
   if (UsbIsHubInterface (UsbIf)) {
     DEBUG ((DEBUG_INFO, "UsbConnectDriver: found a hub device\n"));
-    Status = mUsbHubApi.Init (UsbIf);
-  } else {
-    //
-    // This function is called in both UsbIoControlTransfer and
-    // the timer callback in hub enumeration. So, at least it is
-    // called at TPL_CALLBACK. Some driver sitting on USB has
-    // twisted TPL used. It should be no problem for us to connect
-    // or disconnect at CALLBACK.
-    //
-
-    //
-    // Only recursively wanted usb child device
-    //
-    if (UsbBusIsWantedUsbIO (UsbIf->Device->Bus, UsbIf)) {
-      OldTpl = UsbGetCurrentTpl ();
-      DEBUG ((DEBUG_INFO, "UsbConnectDriver: TPL before connect is %d, %p\n", (UINT32)OldTpl, UsbIf->Handle));
-
-      gBS->RestoreTPL (TPL_CALLBACK);
-
-      Status           = gBS->ConnectController (UsbIf->Handle, NULL, NULL, TRUE);
-      UsbIf->IsManaged = (BOOLEAN) !EFI_ERROR (Status);
-
-      DEBUG ((DEBUG_INFO, "UsbConnectDriver: TPL after connect is %d\n", (UINT32)UsbGetCurrentTpl ()));
-      ASSERT (UsbGetCurrentTpl () == TPL_CALLBACK);
-
-      gBS->RaiseTPL (OldTpl);
-    }
+    return mUsbHubApi.Init (UsbIf);
   }
 
-  return Status;
+  if (!UsbBusIsWantedUsbIO (UsbIf->Device->Bus, UsbIf)) {
+    return EFI_SUCCESS;
+  }
+
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  if ((UsbIf->IfSetting->Desc.InterfaceClass == USB_MASS_STORE_CLASS) &&
+      (UsbIf->IfSetting->Desc.InterfaceProtocol == USB_MASS_STORE_BOT))
+  {
+    return UsbQueueStorageConnect (UsbIf);
+  }
+#endif
+
+  return UsbStartInterfaceDriver (UsbIf);
 }
 
 /**
@@ -662,17 +768,20 @@ UsbFindChild (
   @param  HubIf                 The HUB that has the device connected.
   @param  Port                  The port index of the hub (started with zero).
   @param  ResetIsNeeded         The boolean to control whether skip the reset of the port.
+  @param  RetryCount            Remaining enumeration attempts after this one.
 
   @retval EFI_SUCCESS           The device is enumerated (added or removed).
   @retval EFI_OUT_OF_RESOURCES  Failed to allocate resource for the device.
   @retval Others                Failed to enumerate the device.
 
 **/
+STATIC
 EFI_STATUS
 UsbEnumerateNewDev (
   IN USB_INTERFACE  *HubIf,
   IN UINT8          Port,
-  IN BOOLEAN        ResetIsNeeded
+  IN BOOLEAN        ResetIsNeeded,
+  IN UINT8          RetryCount
   )
 {
   USB_BUS              *Bus;
@@ -683,15 +792,18 @@ UsbEnumerateNewDev (
   UINTN                Address;
   UINT8                Config;
   EFI_STATUS           Status;
+#ifndef T70PRO_RAM_DIAGNOSTICS
   EFI_STATUS           OriginalStatus;
-  UINT8                RetryCount;
+#endif
 
   Parent  = HubIf->Device;
   Bus     = Parent->Bus;
   HubApi  = HubIf->HubApi;
   Address = Bus->MaxDevices;
 
+#ifndef T70PRO_RAM_DIAGNOSTICS
   gBS->Stall (USB_WAIT_PORT_STABLE_STALL);
+#endif
 
   //
   // Hub resets the device for at least 10 milliseconds.
@@ -718,9 +830,11 @@ UsbEnumerateNewDev (
     return EFI_OUT_OF_RESOURCES;
   }
 
-  RetryCount = 3;
-
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  Child->Enumerating = TRUE;
+#else
 DeviceRetry:
+#endif
   //
   // OK, now identify the device speed. After reset, hub
   // fully knows the actual device speed.
@@ -752,8 +866,10 @@ DeviceRetry:
 
   if (!USB_BIT_IS_SET (PortState.PortStatus, USB_PORT_STAT_CONNECTION)) {
     DEBUG ((DEBUG_ERROR, "UsbEnumerateNewDev: No device present at port %d\n", Port));
-    Status     = EFI_NOT_FOUND;
+    Status = EFI_NOT_FOUND;
+#ifndef T70PRO_RAM_DIAGNOSTICS
     RetryCount = 0;
+#endif
     goto ON_ERROR;
   } else if (USB_BIT_IS_SET (PortState.PortStatus, USB_PORT_STAT_SUPER_SPEED)) {
     Child->Speed      = EFI_USB_SPEED_SUPER;
@@ -872,6 +988,9 @@ DeviceRetry:
      && (Child->Speed < EFI_USB_SPEED_SUPER)
      && (Child->DevDesc->Desc.DeviceClass != USB_HUB_CLASS_CODE))
   {
+#ifdef T70PRO_RAM_DIAGNOSTICS
+    Status = EFI_NOT_READY;
+#endif
     goto ON_ERROR;
   }
 
@@ -892,6 +1011,9 @@ DeviceRetry:
   //
   // Host assigns and loads a device driver.
   //
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  Child->Enumerating = FALSE;
+#endif
   Status = UsbSelectConfig (Child, Config);
 
   if (EFI_ERROR (Status)) {
@@ -910,6 +1032,16 @@ DeviceRetry:
   return EFI_SUCCESS;
 
 ON_ERROR:
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  // T70 uses MUSB, which does not retain a hardware address mapping across resets.
+  if (Child->Address == 0) {
+    UsbFreeDevice (Child);
+  } else {
+    UsbRemoveDevice (Child);
+  }
+
+  return Status;
+#else
   //
   // Do the error handling with retry counter.
   //
@@ -950,7 +1082,240 @@ ON_ERROR:
   // EDKII UHCI/EHCI doesn't get impacted as it's make sense to reserve s/w resource till it gets unplugged.
   //
   return OriginalStatus;
+#endif
 }
+
+STATIC
+EFI_STATUS
+UsbProcessPortChange (
+  IN USB_INTERFACE        *HubIf,
+  IN UINT8                Port,
+  IN EFI_USB_PORT_STATUS  PortState,
+  IN EFI_STATUS           Status
+  );
+
+#ifdef T70PRO_RAM_DIAGNOSTICS
+#define USB_HUB_RESET_POLL_US   (10 * USB_BUS_1_MILLISECOND)
+#define USB_HUB_RESET_POLLS     50
+#define USB_PORT_CHANGE_MASK    (USB_PORT_STAT_C_CONNECTION | USB_PORT_STAT_C_OVERCURRENT)
+
+STATIC
+VOID
+UsbReleasePortReset (
+  IN USB_PORT_WORK  *Work
+  )
+{
+  USB_BUS  *Bus;
+
+  Bus = Work->Hub->Device->Bus;
+  if (Bus->ResetOwner == Work) {
+    Bus->ResetOwner = NULL;
+  }
+}
+
+STATIC
+VOID
+UsbClosePortWork (
+  IN USB_PORT_WORK  *Work
+  )
+{
+  if (Work->Event != NULL) {
+    gBS->CloseEvent (Work->Event);
+    Work->Event = NULL;
+    UsbReleasePortReset (Work);
+  }
+}
+
+VOID
+UsbCancelPortWork (
+  IN USB_INTERFACE  *Hub
+  )
+{
+  UINTN  Port;
+
+  if (Hub->PortWork == NULL) {
+    return;
+  }
+
+  for (Port = 0; Port < Hub->NumOfPort; Port++) {
+    UsbClosePortWork (&Hub->PortWork[Port]);
+  }
+
+  FreePool (Hub->PortWork);
+  Hub->PortWork = NULL;
+}
+
+STATIC
+VOID
+UsbClearPortResetChanges (
+  IN USB_INTERFACE  *Hub,
+  IN UINT8          Port,
+  IN UINT16         Changes
+  )
+{
+  if (USB_BIT_IS_SET (Changes, USB_PORT_STAT_C_RESET)) {
+    Hub->HubApi->ClearPortFeature (Hub, Port, EfiUsbPortResetChange);
+  }
+
+  if (USB_BIT_IS_SET (Changes, USB_PORT_STAT_C_ENABLE)) {
+    Hub->HubApi->ClearPortFeature (Hub, Port, EfiUsbPortEnableChange);
+  }
+}
+
+STATIC
+EFI_STATUS
+UsbStepHubPortReset (
+  IN USB_PORT_WORK              *Work,
+  IN CONST EFI_USB_PORT_STATUS  *PortState
+  )
+{
+  USB_INTERFACE  *Hub;
+  EFI_STATUS     Status;
+  UINTN          Delay;
+
+  Hub = Work->Hub;
+  if (Work->Phase == UsbPortWorkReset) {
+    UsbClearPortResetChanges (Hub, Work->Port, PortState->PortChangeStatus);
+    Status = Hub->HubApi->SetPortFeature (Hub, Work->Port, EfiUsbPortReset);
+    if (EFI_ERROR (Status)) {
+      return Status;
+    }
+
+    Work->Phase = UsbPortWorkWaitForReset;
+    Work->ResetPolls = USB_HUB_RESET_POLLS;
+    Delay = USB_SET_PORT_RESET_STALL;
+  } else if (USB_BIT_IS_SET (PortState->PortChangeStatus, USB_PORT_STAT_C_RESET) &&
+             USB_BIT_IS_SET (PortState->PortStatus, USB_PORT_STAT_ENABLE))
+  {
+    UsbClearPortResetChanges (Hub, Work->Port, PortState->PortChangeStatus);
+    Work->Phase = UsbPortWorkEnumerate;
+    Delay = USB_SET_PORT_RECOVERY_STALL;
+  } else {
+    if (--Work->ResetPolls == 0) {
+      return EFI_TIMEOUT;
+    }
+
+    Delay = USB_HUB_RESET_POLL_US;
+  }
+
+  return gBS->SetTimer (Work->Event, TimerRelative, Delay * 10ULL);
+}
+
+STATIC
+VOID
+EFIAPI
+UsbRunPortWork (
+  IN EFI_EVENT  Event,
+  IN VOID       *Context
+  )
+{
+  USB_PORT_WORK        *Work;
+  USB_INTERFACE        *Hub;
+  USB_BUS              *Bus;
+  EFI_USB_PORT_STATUS  PortState;
+  EFI_STATUS           Status;
+  UINT8                Port;
+
+  Work = Context;
+  Hub  = Work->Hub;
+  Bus  = Hub->Device->Bus;
+  Port = Work->Port;
+  Status = Hub->HubApi->GetPortStatus (Hub, Port, &PortState);
+  if (!EFI_ERROR (Status)) {
+    if ((PortState.PortChangeStatus & USB_PORT_CHANGE_MASK) != 0) {
+      UsbProcessPortChange (Hub, Port, PortState, Status);
+      return;
+    }
+
+    if (!USB_BIT_IS_SET (PortState.PortStatus, USB_PORT_STAT_CONNECTION) ||
+        USB_BIT_IS_SET (PortState.PortStatus, USB_PORT_STAT_OVERCURRENT) ||
+        (UsbFindChild (Hub, Port) != NULL))
+    {
+      UsbClosePortWork (Work);
+      return;
+    }
+
+    // Devices at the default address must be reset and addressed one at a time.
+    // Addressed devices can service their endpoints between timer callbacks.
+    if ((Bus->ResetOwner != NULL) && (Bus->ResetOwner != Work)) {
+      if (EFI_ERROR (gBS->SetTimer (Event, TimerRelative, USB_HUB_RESET_POLL_US * 10ULL))) {
+        UsbClosePortWork (Work);
+      }
+
+      return;
+    }
+
+    if ((Hub->HubApi == &mUsbHubApi) && (Work->Phase != UsbPortWorkEnumerate)) {
+      Bus->ResetOwner = Work;
+      Status = UsbStepHubPortReset (Work, &PortState);
+      if (!EFI_ERROR (Status)) {
+        return;
+      }
+    } else {
+      Status = UsbEnumerateNewDev (Hub, Port, Work->Phase == UsbPortWorkReset, Work->Retries);
+      if (Work->Phase == UsbPortWorkReset) {
+        UsbClearPortResetChanges (Hub, Port, USB_PORT_STAT_C_RESET | USB_PORT_STAT_C_ENABLE);
+      }
+    }
+  }
+
+  if (EFI_ERROR (Status) && (Status != EFI_NOT_FOUND)) {
+    if (Bus->ResetOwner == Work) {
+      // A failed reset may have left an unaddressed device active on this port.
+      Hub->HubApi->ClearPortFeature (Hub, Port, EfiUsbPortEnable);
+      UsbClearPortResetChanges (Hub, Port, USB_PORT_STAT_C_RESET | USB_PORT_STAT_C_ENABLE);
+      UsbReleasePortReset (Work);
+    }
+
+    if (Work->Retries != 0) {
+      Work->Retries--;
+      Work->Phase = UsbPortWorkReset;
+      if (!EFI_ERROR (gBS->SetTimer (Event, TimerRelative, USB_WAIT_PORT_STABLE_STALL * 10ULL))) {
+        return;
+      }
+    }
+  }
+
+  UsbClosePortWork (Work);
+}
+
+STATIC
+EFI_STATUS
+UsbQueuePortWork (
+  IN USB_INTERFACE  *Hub,
+  IN UINT8          Port,
+  IN BOOLEAN        ResetNeeded
+  )
+{
+  USB_PORT_WORK  *Work;
+  EFI_STATUS     Status;
+
+  if (Hub->PortWork == NULL) {
+    Hub->PortWork = AllocateZeroPool (Hub->NumOfPort * sizeof (*Work));
+    if (Hub->PortWork == NULL) {
+      return EFI_OUT_OF_RESOURCES;
+    }
+  }
+
+  Work = &Hub->PortWork[Port];
+  UsbClosePortWork (Work);
+  Work->Hub     = Hub;
+  Work->Port    = Port;
+  Work->Retries = 3;
+  Work->Phase   = ResetNeeded ? UsbPortWorkReset : UsbPortWorkEnumerate;
+  Status = gBS->CreateEvent (EVT_TIMER | EVT_NOTIFY_SIGNAL, TPL_CALLBACK, UsbRunPortWork, Work, &Work->Event);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = gBS->SetTimer (Work->Event, TimerRelative, USB_WAIT_PORT_STABLE_STALL * 10ULL);
+  if (EFI_ERROR (Status)) {
+    UsbClosePortWork (Work);
+  }
+
+  return Status;
+}
+#endif
 
 /**
   Process the events on the port.
@@ -963,19 +1328,15 @@ ON_ERROR:
   @retval Others                Failed to enumerate the device.
 
 **/
+STATIC
 EFI_STATUS
 UsbEnumeratePort (
   IN USB_INTERFACE  *HubIf,
   IN UINT8          Port
   )
 {
-  USB_HUB_API          *HubApi;
-  USB_DEVICE           *Child;
   EFI_USB_PORT_STATUS  PortState;
   EFI_STATUS           Status;
-
-  Child  = NULL;
-  HubApi = HubIf->HubApi;
 
   // Zero out PortState in case GetPortStatus does not set
   // it and we continue on the EFI_DEVICE_ERROR path
@@ -985,12 +1346,29 @@ UsbEnumeratePort (
   //
   // Host learns of the new device by polling the hub for port changes.
   //
-  Status = HubApi->GetPortStatus (HubIf, Port, &PortState);
+  Status = HubIf->HubApi->GetPortStatus (HubIf, Port, &PortState);
 
   if (EFI_ERROR (Status) && (Status != EFI_DEVICE_ERROR)) {
     DEBUG ((DEBUG_ERROR, "UsbEnumeratePort: failed to get state of port %d\n", Port));
     return Status;
   }
+
+  return UsbProcessPortChange (HubIf, Port, PortState, Status);
+}
+
+STATIC
+EFI_STATUS
+UsbProcessPortChange (
+  IN USB_INTERFACE        *HubIf,
+  IN UINT8                Port,
+  IN EFI_USB_PORT_STATUS  PortState,
+  IN EFI_STATUS           Status
+  )
+{
+  USB_HUB_API  *HubApi;
+  USB_DEVICE   *Child;
+
+  HubApi = HubIf->HubApi;
 
   //
   // Only handle connection/enable/overcurrent/reset change.
@@ -999,6 +1377,20 @@ UsbEnumeratePort (
   if ((PortState.PortChangeStatus & (USB_PORT_STAT_C_CONNECTION | USB_PORT_STAT_C_ENABLE | USB_PORT_STAT_C_OVERCURRENT | USB_PORT_STAT_C_RESET)) == 0) {
     return EFI_SUCCESS;
   }
+
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  if (HubIf->PortWork != NULL) {
+    if ((HubIf->PortWork[Port].Event != NULL) &&
+        ((PortState.PortChangeStatus & USB_PORT_CHANGE_MASK) == 0) &&
+        USB_BIT_IS_SET (PortState.PortStatus, USB_PORT_STAT_CONNECTION))
+    {
+      // The queued port worker handles reset and enable changes it causes.
+      return EFI_SUCCESS;
+    }
+
+    UsbClosePortWork (&HubIf->PortWork[Port]);
+  }
+#endif
 
   DEBUG ((
     DEBUG_INFO,
@@ -1061,7 +1453,13 @@ UsbEnumeratePort (
 
   if (Child != NULL) {
     DEBUG ((DEBUG_INFO, "UsbEnumeratePort: device at port %d removed from root hub %p\n", Port, HubIf));
+#ifdef T70PRO_RAM_DIAGNOSTICS
+    if (EFI_ERROR (UsbRemoveDevice (Child))) {
+      return EFI_DEVICE_ERROR;
+    }
+#else
     UsbRemoveDevice (Child);
+#endif
   }
 
   if (USB_BIT_IS_SET (PortState.PortStatus, USB_PORT_STAT_CONNECTION)) {
@@ -1069,13 +1467,22 @@ UsbEnumeratePort (
     // Now, new device connected, enumerate and configure the device
     //
     DEBUG ((DEBUG_INFO, "UsbEnumeratePort: new device connected at port %d\n", Port));
+#ifdef T70PRO_RAM_DIAGNOSTICS
+    HubApi->ClearPortChange (HubIf, Port);
+    return UsbQueuePortWork (
+             HubIf,
+             Port,
+             !USB_BIT_IS_SET (PortState.PortChangeStatus, USB_PORT_STAT_C_RESET) || (Status == EFI_DEVICE_ERROR)
+             );
+#else
     if (USB_BIT_IS_SET (PortState.PortChangeStatus, USB_PORT_STAT_C_RESET) &&
         (Status != EFI_DEVICE_ERROR))
     {
-      Status = UsbEnumerateNewDev (HubIf, Port, FALSE);
+      Status = UsbEnumerateNewDev (HubIf, Port, FALSE, 3);
     } else {
-      Status = UsbEnumerateNewDev (HubIf, Port, TRUE);
+      Status = UsbEnumerateNewDev (HubIf, Port, TRUE, 3);
     }
+#endif
   } else {
     DEBUG ((DEBUG_INFO, "UsbEnumeratePort: device disconnected event on port %d\n", Port));
   }
@@ -1160,14 +1567,6 @@ UsbRootHubEnumeration (
   USB_DEVICE     *Child;
 
   RootHub = (USB_INTERFACE *)Context;
-
-  // MU_CHANGE [BEGIN]
-  // MU_CHANGE Implement Enumeration delay
-  if (RootHub->PollCount < USB_ENUM_POLL_MAXIMUM_ATTEMPTS) {
-    RootHub->PollCount++;
-  }
-
-  // MU_CHANGE [END]
 
   for (Index = 0; Index < RootHub->NumOfPort; Index++) {
     Child = UsbFindChild (RootHub, Index);

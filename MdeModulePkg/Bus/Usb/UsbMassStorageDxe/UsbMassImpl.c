@@ -464,7 +464,10 @@ UsbMassInitTransport (
   // Otherwise, it is a multi-lun device.
   //
   if ((*Transport)->Protocol == USB_MASS_STORE_BOT) {
-    (*Transport)->GetMaxLun (*Context, MaxLun);
+#ifdef T70PRO_RAM_DIAGNOSTICS
+    ((USB_BOT_PROTOCOL *)*Context)->MediaProbe = TRUE;
+#endif
+    Status = (*Transport)->GetMaxLun (*Context, MaxLun);
   }
 
 ON_EXIT:
@@ -537,6 +540,15 @@ UsbMassInitMultiLun (
     if ((EFI_ERROR (Status)) && (Status != EFI_NO_MEDIA)) {
       DEBUG ((DEBUG_ERROR, "UsbMassInitMultiLun: UsbMassInitMedia (%r)\n", Status));
       FreePool (UsbMass);
+#ifdef T70PRO_RAM_DIAGNOSTICS
+      if (Status == EFI_TIMEOUT) {
+        return EFI_ERROR (ReturnStatus) ? Status : ReturnStatus;
+      }
+
+      if ((Status == EFI_NOT_READY) && (ReturnStatus == EFI_NOT_FOUND)) {
+        ReturnStatus = Status;
+      }
+#endif
       continue;
     }
 
@@ -908,6 +920,16 @@ USBMassDriverBindingStart (
   }
 
 Exit:
+  if (Context != NULL) {
+    if (EFI_ERROR (Status)) {
+      Transport->CleanUp (Context);
+    }
+#ifdef T70PRO_RAM_DIAGNOSTICS
+    else if (Transport->Protocol == USB_MASS_STORE_BOT) {
+      ((USB_BOT_PROTOCOL *)Context)->MediaProbe = FALSE;
+    }
+#endif
+  }
   T70UsbStorageDiagnostic (Controller, 5, Status, 0, 0, 0, 0, 0, 0);
   gBS->RestoreTPL (OldTpl);
   return Status;

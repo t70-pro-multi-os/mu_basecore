@@ -944,6 +944,9 @@ UsbHubRelease (
   }
 
   gBS->CloseEvent (HubIf->HubNotify);
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  UsbCancelPortWork (HubIf);
+#endif
 
   HubIf->IsHub     = FALSE;
   HubIf->HubApi    = NULL;
@@ -1009,42 +1012,23 @@ UsbRootHubInit (
     return Status;
   }
 
-  //
-  // It should signal the event immediately here, or device detection
-  // by bus enumeration might be delayed by the timer interval.
-  //
-  gBS->SignalEvent (HubIf->HubNotify);
-
   Status = gBS->SetTimer (
                   HubIf->HubNotify,
                   TimerPeriodic,
                   USB_ROOTHUB_POLL_INTERVAL
                   );
-
   if (EFI_ERROR (Status)) {
     gBS->CloseEvent (HubIf->HubNotify);
-    // MU_CHANGE [BEGIN]
-  } else {
-    // MU_CHANGE Add USB Hub Enumeration delay
-    EFI_TPL  OldTpl;
-
-    OldTpl = gBS->RaiseTPL (TPL_HIGH_LEVEL);
-    gBS->RestoreTPL (TPL_APPLICATION);
-
-    while (HubIf->PollCount < USB_ENUM_POLL_MINIMUM_ATTEMPTS) {
-      // wait for a minimum of USB_ENUM_POLL_MINIMUM_ATTEMPTS * (USB_ROOTHUB_POLL_INTERVAL 100 ms)
-      // with the asynchronous periodic timer interrupt that checks for hub enumeration
-      // and updates PollCount on each timer trigger
-    }
-
-    if (OldTpl > TPL_APPLICATION) {
-      gBS->RaiseTPL (OldTpl);
-    }
-
-    // MU_CHANGE [END]
+    HubIf->HubNotify = NULL;
+    return Status;
   }
 
-  return Status;
+  //
+  // Queue the first enumeration without lowering the caller's TPL or
+  // waiting for subsequent timer notifications during a hot connection.
+  //
+  gBS->SignalEvent (HubIf->HubNotify);
+  return EFI_SUCCESS;
 }
 
 /**
@@ -1308,6 +1292,9 @@ UsbRootHubRelease (
 
   gBS->SetTimer (HubIf->HubNotify, TimerCancel, USB_ROOTHUB_POLL_INTERVAL);
   gBS->CloseEvent (HubIf->HubNotify);
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  UsbCancelPortWork (HubIf);
+#endif
 
   return EFI_SUCCESS;
 }

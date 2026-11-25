@@ -618,7 +618,11 @@ FormExitPolicy (
   VOID
   )
 {
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  return TRUE;
+#else
   return gClassOfVfr == FORMSET_CLASS_FRONT_PAGE ? FALSE : TRUE;
+#endif
 }
 
 /**

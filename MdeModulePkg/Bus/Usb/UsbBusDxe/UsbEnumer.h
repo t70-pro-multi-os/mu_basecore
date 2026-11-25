@@ -9,6 +9,13 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
 
 #pragma once
 
+#ifdef T70PRO_RAM_DIAGNOSTICS
+VOID
+UsbCancelPortWork (
+  IN USB_INTERFACE  *Hub
+  );
+#endif
+
 //
 // Advance the byte and bit to the next bit, adjust byte accordingly.
 //

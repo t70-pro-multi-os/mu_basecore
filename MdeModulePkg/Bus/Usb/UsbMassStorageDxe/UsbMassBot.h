@@ -80,6 +80,9 @@ typedef struct {
   EFI_USB_ENDPOINT_DESCRIPTOR     *BulkOutEndpoint;
   UINT32                          CbwTag;
   EFI_USB_IO_PROTOCOL             *UsbIo;
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  BOOLEAN                         MediaProbe;
+#endif
 } USB_BOT_PROTOCOL;
 
 /**

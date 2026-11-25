@@ -19,7 +19,11 @@ VOID T70UsbStorageDiagnostic (EFI_HANDLE Controller, UINT32 Stage,
   for (I = 0; I < mDiag.Count; I++)
     if (mDiag.Records[I].Controller == Controller) { R = &mDiag.Records[I]; break; }
   if (R == NULL && mDiag.Count < T70_USB_DIAG_MAX) R = &mDiag.Records[mDiag.Count++];
-  if (R == NULL) { mDiag.Dropped++; gBS->RestoreTPL (Old); return; }
+  if (R == NULL) {
+    // Reuse a slot so the current bind result is available after ConnectController.
+    R = &mDiag.Records[mDiag.Dropped++ % T70_USB_DIAG_MAX];
+    ZeroMem (R, sizeof (*R));
+  }
   if (Stage == 1) { ZeroMem (R, sizeof (*R)); R->BindStatus = EFI_NOT_READY; }
   R->Controller = Controller; R->Stage = Stage; R->Sequence = ++mDiag.Sequence;
   if (Stage == 2 || Stage == 5) R->BindStatus = Status;

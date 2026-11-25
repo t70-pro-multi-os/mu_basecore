@@ -12,6 +12,12 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
 
 #include "Partition.h"
 
+#ifdef T70PRO_RAM_DIAGNOSTICS
+#include <Protocol/T70UsbStorageDiagnostics.h>
+STATIC EFI_GUID                mUsbBootTraceGuid = T70_USB_BOOT_READ_TRACE_GUID;
+STATIC T70_USB_BOOT_READ_TRACE mUsbBootTrace;
+#endif
+
 //
 // Partition Driver Global Variables.
 //
@@ -679,24 +685,40 @@ PartitionReadBlocks (
 {
   PARTITION_PRIVATE_DATA  *Private;
   UINT64                  Offset;
+  EFI_STATUS              Status;
 
   Private = PARTITION_DEVICE_FROM_BLOCK_IO_THIS (This);
-
+  Offset  = MultU64x32 (Lba, Private->BlockSize) + Private->Start;
   if (BufferSize % Private->BlockSize != 0) {
-    return ProbeMediaStatus (Private->DiskIo, MediaId, EFI_BAD_BUFFER_SIZE);
+    Status = ProbeMediaStatus (Private->DiskIo, MediaId, EFI_BAD_BUFFER_SIZE);
+  } else if (Offset + BufferSize > Private->End) {
+    Status = ProbeMediaStatus (Private->DiskIo, MediaId, EFI_INVALID_PARAMETER);
+  } else {
+    // Disk I/O translates byte offsets for partitions with a different block size.
+    Status = Private->DiskIo->ReadDisk (Private->DiskIo, MediaId, Offset, BufferSize, Buffer);
   }
 
-  Offset = MultU64x32 (Lba, Private->BlockSize) + Private->Start;
-  if (Offset + BufferSize > Private->End) {
-    return ProbeMediaStatus (Private->DiskIo, MediaId, EFI_INVALID_PARAMETER);
-  }
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  if (mUsbBootTrace.Active && (mUsbBootTrace.PartitionBlockIo == This)) {
+    EFI_TPL OldTpl = gBS->RaiseTPL (TPL_NOTIFY);
+    ++mUsbBootTrace.Reads;
+    if (EFI_ERROR (Status) && !EFI_ERROR (mUsbBootTrace.FirstError)) {
+      mUsbBootTrace.FirstError   = Status;
+      mUsbBootTrace.ErrorLba     = Lba;
+      mUsbBootTrace.ErrorBytes   = BufferSize;
+      mUsbBootTrace.ErrorMediaId = MediaId;
+    }
 
-  //
-  // Because some kinds of partition have different block size from their parent
-  // device, we call the Disk IO protocol on the parent device, not the Block IO
-  // protocol
-  //
-  return Private->DiskIo->ReadDisk (Private->DiskIo, MediaId, Offset, BufferSize, Buffer);
+    // Record the registry hive signature only. Do not retain sectors or file contents.
+    if (!EFI_ERROR (Status) && (BufferSize >= 4) && (Buffer != NULL) &&
+        (CompareMem (Buffer, "regf", 4) == 0))
+    {
+      ++mUsbBootTrace.HiveReads;
+    }
+    gBS->RestoreTPL (OldTpl);
+  }
+#endif
+  return Status;
 }
 
 /**
@@ -1338,6 +1360,17 @@ InitializePartition (
              &gPartitionComponentName2
              );
   ASSERT_EFI_ERROR (Status);
+
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  if (!EFI_ERROR (Status)) {
+    (VOID)gBS->InstallProtocolInterface (
+                 &ImageHandle,
+                 &mUsbBootTraceGuid,
+                 EFI_NATIVE_INTERFACE,
+                 &mUsbBootTrace
+                 );
+  }
+#endif
 
   return Status;
 }

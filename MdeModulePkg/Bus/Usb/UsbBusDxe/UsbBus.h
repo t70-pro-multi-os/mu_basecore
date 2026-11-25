@@ -32,6 +32,23 @@ typedef struct _USB_INTERFACE  USB_INTERFACE;
 typedef struct _USB_BUS        USB_BUS;
 typedef struct _USB_HUB_API    USB_HUB_API;
 
+#ifdef T70PRO_RAM_DIAGNOSTICS
+typedef enum {
+  UsbPortWorkReset,
+  UsbPortWorkWaitForReset,
+  UsbPortWorkEnumerate
+} USB_PORT_WORK_PHASE;
+
+typedef struct {
+  EFI_EVENT              Event;
+  USB_INTERFACE          *Hub;
+  UINT8                  Port;
+  UINT8                  Retries;
+  UINT8                  ResetPolls;
+  USB_PORT_WORK_PHASE    Phase;
+} USB_PORT_WORK;
+#endif
+
 #include "UsbUtility.h"
 #include "UsbDesc.h"
 #include "UsbHub.h"
@@ -54,14 +71,6 @@ typedef struct _USB_HUB_API    USB_HUB_API;
 //
 #define USB_ROOTHUB_POLL_INTERVAL  (100 * 10000U)
 #define USB_HUB_POLL_INTERVAL      64
-//
-// defines the minimum number of enumeration attempts
-//
-#define USB_ENUM_POLL_MINIMUM_ATTEMPTS  6 // MU_CHANGE
-//
-// defines the maximum number of enumeration attempts
-//
-#define USB_ENUM_POLL_MAXIMUM_ATTEMPTS  200 // MU_CHANGE
 
 //
 // Wait for port stable to work, refers to specification
@@ -208,6 +217,9 @@ struct _USB_DEVICE {
   BOOLEAN                               DisconnectFail;
   UINT8                                 EnumScript;
   BOOLEAN                               IsSSDev;
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  BOOLEAN                               Enumerating;
+#endif
 };
 
 //
@@ -226,6 +238,12 @@ struct _USB_INTERFACE {
   EFI_USB_IO_PROTOCOL         UsbIo;
   EFI_DEVICE_PATH_PROTOCOL    *DevicePath;
   BOOLEAN                     IsManaged;
+
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  EFI_EVENT                   StorageConnectEvent;
+  UINT8                       StorageConnectAttempts;
+  USB_PORT_WORK               *PortWork;
+#endif
 
   //
   // Hub device special data
@@ -251,7 +269,6 @@ struct _USB_INTERFACE {
   //
   // Track the the number of enumeration attempts
   //
-  volatile UINT8              PollCount;
   // MU_CHANGE [END] - 168923
 };
 
@@ -280,6 +297,10 @@ struct _USB_BUS {
   // for root hub. Device with address i is at Devices[i].
   //
   USB_DEVICE                  *Devices[256];
+
+#ifdef T70PRO_RAM_DIAGNOSTICS
+  USB_PORT_WORK               *ResetOwner;
+#endif
 
   //
   // USB Bus driver need to control the recursive connect policy of the bus, only those wanted
